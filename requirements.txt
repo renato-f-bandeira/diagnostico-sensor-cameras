@@ -1,0 +1,8 @@
+streamlit
+rawpy
+opencv-python-headless
+numpy
+matplotlib
+tifffile
+imagecodecs
+scipy
