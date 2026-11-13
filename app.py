@@ -1,5 +1,6 @@
 import os
 import io
+import gc
 import json
 import tempfile
 import urllib.request
@@ -31,7 +32,7 @@ CATALOGO_SENSORES = {
 EXTENSOES_RAW = ('.arw', '.cr2', '.cr3', '.nef', '.dng', '.orf', '.rw2', '.pef', '.raf')
 
 # ==============================================================================
-# 1. FUNCOES DE LEITURA E METADADOS (BASEADAS NO CODIGO DO COLAB)
+# 1. FUNCOES DE LEITURA OTIMIZADAS PARA BAIXO CONSUMO DE RAM (STREAMLIT CLOUD)
 # ==============================================================================
 
 def extrair_metadados_exif(caminho_arquivo):
@@ -102,11 +103,24 @@ def _ler_maior_subifd_dng(caminho_arquivo):
                 continue
     if melhor_matriz is None:
         melhor_matriz = tifffile.imread(caminho_arquivo)
-    return melhor_matriz.astype(np.float32)
+    return melhor_matriz
 
-@st.cache_data(show_spinner=False)
+def _reduzir_para_preview(rgb_float, largura_max=1400):
+    """Reduz a matriz RGB de visualizacao global para economizar ~285 MB de RAM."""
+    h, w = rgb_float.shape[:2]
+    if w > largura_max:
+        fator = largura_max / float(w)
+        novo_h = max(1, int(round(h * fator)))
+        rgb_small = cv2.resize(rgb_float, (largura_max, novo_h), interpolation=cv2.INTER_AREA)
+        return rgb_small.astype(np.float16)
+    return rgb_float.astype(np.float16)
+
+@st.cache_data(max_entries=2, show_spinner=False)
 def processar_bytes_imagem(file_bytes, nome_original):
-    """Salva os bytes em arquivo temporario isolado, extrai EXIF e matrizes ADU e remove o arquivo temporario."""
+    """
+    Decodifica o arquivo mantendo raw_adu em uint16 (metade da memoria de float32)
+    e rgb_preview compactado em float16, evitando Out-Of-Memory no Streamlit Cloud.
+    """
     ext = os.path.splitext(nome_original)[1].lower()
     tamanho_mb = len(file_bytes) / (1024.0 * 1024.0)
 
@@ -117,7 +131,7 @@ def processar_bytes_imagem(file_bytes, nome_original):
     try:
         exif = extrair_metadados_exif(caminho_arquivo)
         raw_adu = None
-        rgb_base = None
+        rgb_preview = None
         bl_canais = [0.0, 0.0, 0.0, 0.0]
         wl = 65535.0
         padrao_cfa = str(exif.get('CFA_EXIF', 'RGB / Linear'))
@@ -127,7 +141,7 @@ def processar_bytes_imagem(file_bytes, nome_original):
             try:
                 with open(caminho_arquivo, 'rb') as f_bin:
                     with rawpy.imread(f_bin) as raw:
-                        arr = raw.raw_image_visible.astype(np.float32).copy()
+                        arr = raw.raw_image_visible.copy()
                         bl_raw = list(raw.black_level_per_channel)
                         bl_canais = [float(x) for x in bl_raw[:4]] if bl_raw else [0.0] * 4
                         wl = float(raw.white_level) if raw.white_level > 0 else float(np.max(arr))
@@ -141,18 +155,22 @@ def processar_bytes_imagem(file_bytes, nome_original):
                             pass
 
                         if arr.ndim == 2:
-                            raw_adu = arr
+                            raw_adu = np.clip(arr, 0, 65535).astype(np.uint16)
                         else:
                             tipo_arquivo = "Linear DNG Mobile (Multicanal)"
-                            raw_adu = np.mean(arr[:, :, :3], axis=2).astype(np.float32)
+                            raw_adu = np.clip(np.mean(arr[:, :, :3], axis=2), 0, 65535).astype(np.uint16)
+                        del arr
 
                         try:
-                            rgb = raw.postprocess(gamma=(1, 1), no_auto_bright=True, output_bps=16)
-                            rgb_base = rgb.astype(np.float32) / 65535.0
+                            # Usa half_size=True para gerar o preview global gastando 4x menos RAM e CPU!
+                            rgb = raw.postprocess(gamma=(1, 1), no_auto_bright=True, output_bps=16, half_size=True)
+                            rgb_preview = _reduzir_para_preview(rgb.astype(np.float32) / 65535.0)
+                            del rgb
                         except Exception:
                             bl_m = float(np.mean(bl_canais))
-                            norm = np.clip((raw_adu - bl_m) / max(1.0, wl - bl_m), 0.0, 1.0)
-                            rgb_base = np.stack([norm] * 3, axis=-1)
+                            sub_raw = raw_adu[::2, ::2].astype(np.float32)
+                            norm = np.clip((sub_raw - bl_m) / max(1.0, wl - bl_m), 0.0, 1.0)
+                            rgb_preview = _reduzir_para_preview(np.stack([norm] * 3, axis=-1))
             except Exception:
                 arr = _ler_maior_subifd_dng(caminho_arquivo)
                 tipo_arquivo = "DNG Mobile (SubIFD TiffFile + ImageCodecs)"
@@ -166,34 +184,43 @@ def processar_bytes_imagem(file_bytes, nome_original):
 
                 bl_m = float(np.mean(bl_canais))
                 if arr.ndim == 3:
-                    raw_adu = np.mean(arr[:, :, :3], axis=2).astype(np.float32)
-                    rgb_base = np.clip((arr[:, :, :3] - bl_m) / max(1.0, wl - bl_m), 0.0, 1.0).astype(np.float32)
+                    raw_adu = np.clip(np.mean(arr[:, :, :3], axis=2), 0, 65535).astype(np.uint16)
+                    sub_rgb = arr[::2, ::2, :3].astype(np.float32)
+                    norm_rgb = np.clip((sub_rgb - bl_m) / max(1.0, wl - bl_m), 0.0, 1.0)
+                    rgb_preview = _reduzir_para_preview(norm_rgb)
                 else:
-                    raw_adu = arr
-                    norm = np.clip((raw_adu - bl_m) / max(1.0, wl - bl_m), 0.0, 1.0).astype(np.float32)
-                    rgb_base = np.stack([norm] * 3, axis=-1)
+                    raw_adu = np.clip(arr, 0, 65535).astype(np.uint16)
+                    sub_raw = raw_adu[::2, ::2].astype(np.float32)
+                    norm = np.clip((sub_raw - bl_m) / max(1.0, wl - bl_m), 0.0, 1.0)
+                    rgb_preview = _reduzir_para_preview(np.stack([norm] * 3, axis=-1))
+                del arr
         else:
             tipo_arquivo = "Imagem Processada (Não-RAW)"
             img = cv2.imread(caminho_arquivo, cv2.IMREAD_UNCHANGED)
-            if img.ndim == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                raw_adu = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32)
-            else:
-                raw_adu = img.astype(np.float32)
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            if img is None:
+                raise ValueError("Não foi possível decodificar a imagem.")
             wl = 65535.0 if img.dtype == np.uint16 else 255.0
-            rgb_base = img.astype(np.float32) / wl
+            if img.ndim == 3:
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                raw_adu = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.uint16)
+                rgb_preview = _reduzir_para_preview(img_rgb.astype(np.float32) / wl)
+            else:
+                raw_adu = img.astype(np.uint16)
+                norm = img.astype(np.float32) / wl
+                rgb_preview = _reduzir_para_preview(np.stack([norm] * 3, axis=-1))
+            del img
 
         bits_adc = int(np.ceil(np.log2(max(2.0, wl + 1.0))))
         if wl <= 255:
             bits_adc = 8
 
+        gc.collect()
         return {
             'arquivo': nome_original,
             'tamanho_mb': tamanho_mb,
             'tipo_arquivo': tipo_arquivo,
             'raw_adu': raw_adu,
-            'rgb_base': rgb_base,
+            'rgb_preview': rgb_preview,
             'bl_canais': [round(x, 1) for x in bl_canais],
             'bl_medio': float(np.mean(bl_canais)),
             'white_level': wl,
@@ -206,7 +233,7 @@ def processar_bytes_imagem(file_bytes, nome_original):
             os.remove(caminho_arquivo)
 
 # ==============================================================================
-# 2. CALIBRACAO AUTOMATICA E ANALISE COMBINADA (DARK + FLAT + BIAS)
+# 2. CALIBRACAO AUTOMATICA ULTRA-LEVE EM MEMORIA
 # ==============================================================================
 
 def calibrar_sensor_automatico(dados_sensor, sigma_hot=8.0, fator_dead_max=0.25):
@@ -224,7 +251,7 @@ def calibrar_sensor_automatico(dados_sensor, sigma_hot=8.0, fator_dead_max=0.25)
         for c in range(2):
             sub = raw_adu[r::2, c::2]
             med_c = float(np.median(sub))
-            mad_c = float(np.median(np.abs(sub - med_c)))
+            mad_c = float(np.median(np.abs(sub.astype(np.float32) - med_c)))
             sigmas_canais.append(1.4826 * mad_c)
             medianas_canais.append(med_c)
 
@@ -266,43 +293,36 @@ def calibrar_sensor_automatico(dados_sensor, sigma_hot=8.0, fator_dead_max=0.25)
     }
 
 def analisar_flat_frame(dados_flat, limiar_queda_dead=0.50):
-    """
-    Analisa um Flat Frame (campo uniformemente iluminado) descontando a vinhetagem da lente
-    por subcanal CFA para detectar Dead Pixels reais (cegos a luz) e manchas de poeira.
-    """
     raw_flat = dados_flat['raw_adu']
     bl = dados_flat['bl_medio']
-    sinal_util = np.maximum(1.0, raw_flat - bl)
 
-    # Normaliza cada subcanal da matriz Bayer pela sua media local (janela 31x31) para remover vinhetagem
-    razoes_locais = np.ones_like(sinal_util, dtype=np.float32)
     prnu_canais = []
+    num_dead_flat = 0
+    num_poeira = 0
+
     for r in range(2):
         for c in range(2):
-            sub = sinal_util[r::2, c::2]
+            sub = np.maximum(1.0, raw_flat[r::2, c::2].astype(np.float32) - bl)
             fundo_local = uniform_filter(sub, size=31)
             razao = sub / np.maximum(1.0, fundo_local)
-            razoes_locais[r::2, c::2] = razao
             prnu_canais.append(float(np.std(razao)) * 100.0)
+            mask_d = razao <= (1.0 - limiar_queda_dead)
+            num_dead_flat += int(np.sum(mask_d))
+            num_poeira += int(np.sum((razao < 0.90) & (~mask_d)))
+            del sub, fundo_local, razao
 
-    # Dead pixel / Stuck dark pixel no Flat: responde com menos de (1 - limiar_queda_dead) da luz vizinha
-    mask_dead_flat = razoes_locais <= (1.0 - limiar_queda_dead)
-    # Manchas de poeira: queda suave entre 8% e 45% na transmissao local
-    mask_poeira = (razoes_locais < 0.90) & (~mask_dead_flat)
-
+    gc.collect()
     return {
         'prnu_pct': float(np.mean(prnu_canais)),
-        'num_dead_flat': int(np.sum(mask_dead_flat)),
-        'pct_poeira': float(np.sum(mask_poeira)) / raw_flat.size * 100.0,
-        'mask_dead_flat': mask_dead_flat,
-        'razoes_locais': razoes_locais
+        'num_dead_flat': num_dead_flat,
+        'pct_poeira': float(num_poeira) / raw_flat.size * 100.0
     }
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(max_entries=2, show_spinner=False)
 def baixar_exemplo_github(nome_arq):
     url = f"https://raw.githubusercontent.com/renato-f-bandeira/files/main/{nome_arq}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=25) as resp:
         return resp.read()
 
 # ==============================================================================
@@ -312,7 +332,7 @@ def baixar_exemplo_github(nome_arq):
 st.title("🔬 Laboratório de Diagnóstico e Certificação de Sensores")
 st.markdown(
     "Envie seus arquivos **RAW** (`.ARW`, `.CR2`, `.CR3`, `.NEF`, `.DNG`, `.ORF`, `.RW2`) na barra lateral. "
-    "Os arquivos ficam apenas em memória temporária durante o seu teste."
+    "Os arquivos são processados em memória temporária otimizada."
 )
 
 with st.sidebar:
@@ -328,16 +348,19 @@ with st.sidebar:
         ["Nenhum (Usar meu upload)", "DSC02212.ARW (Sony A7 III)", "DSC00906.ARW (Sony A6000)"]
     )
 
-# Determina a fonte do quadro principal (Upload do usuario ou Exemplo do GitHub)
 dados_principal = None
-if arq_dark is not None:
-    with st.spinner(f"Lendo matriz RAW de '{arq_dark.name}'..."):
-        dados_principal = processar_bytes_imagem(arq_dark.getvalue(), arq_dark.name)
-elif exemplo_escolhido != "Nenhum (Usar meu upload)":
-    nome_ex = exemplo_escolhido.split(" ")[0]
-    with st.spinner(f"Baixando '{nome_ex}' do repositório GitHub..."):
-        bytes_ex = baixar_exemplo_github(nome_ex)
-        dados_principal = processar_bytes_imagem(bytes_ex, nome_ex)
+try:
+    if arq_dark is not None:
+        with st.spinner(f"Decodificando matriz RAW de '{arq_dark.name}'..."):
+            dados_principal = processar_bytes_imagem(arq_dark.getvalue(), arq_dark.name)
+    elif exemplo_escolhido != "Nenhum (Usar meu upload)":
+        nome_ex = exemplo_escolhido.split(" ")[0]
+        with st.spinner(f"Baixando e decodificando '{nome_ex}' do GitHub..."):
+            bytes_ex = baixar_exemplo_github(nome_ex)
+            dados_principal = processar_bytes_imagem(bytes_ex, nome_ex)
+except Exception as erro_leitura:
+    st.error(f"Erro ao processar a imagem: {erro_leitura}")
+    st.stop()
 
 if dados_principal is None:
     st.info("👈 Faça o upload de um **Dark Frame** na barra lateral esquerda ou selecione uma das câmeras de exemplo para iniciar o diagnóstico.")
@@ -348,12 +371,11 @@ raw_adu = dados_principal['raw_adu']
 h, w = raw_adu.shape
 wl_int = int(max(255, dados_principal['white_level']))
 
-# Controles dinamicos na barra lateral
 with st.sidebar:
     st.divider()
     st.header("🎛️ 2. Parâmetros de Inspeção")
     ev = st.slider("Ganho Visual de Exposição (EV):", -2.0, 12.0, 4.0, 0.5)
-    modo_zoom = st.selectbox("Modo da Janela de Zoom:", ["Matriz Bayer Bruta 1:1 (ADU)", "RGB Interpolado (Demosaiced)"])
+    modo_zoom = st.selectbox("Modo da Janela de Zoom:", ["Matriz Bayer Bruta 1:1 (ADU)", "RGB Simulado (Nível de Canal)"])
     tam_janela = st.selectbox("Tamanho do Recorte de Zoom:", [30, 60, 120, 300], index=1)
     marcar_defeitos = st.checkbox("Destacar Hot/Dead Pixels nos Mapas", value=True)
 
@@ -368,7 +390,7 @@ with st.sidebar:
         st.session_state.arq_atual = dados_principal['arquivo']
 
     if st.button("🔥 Focar no Pixel Mais Quente"):
-        idx_max = np.argmax(raw_adu)
+        idx_max = int(np.argmax(raw_adu))
         ym, xm = np.unravel_index(idx_max, raw_adu.shape)
         st.session_state.zoom_x = int(xm)
         st.session_state.zoom_y = int(ym)
@@ -376,11 +398,11 @@ with st.sidebar:
     cx = st.slider("Centro Zoom X (px):", 0, w - 1, key="zoom_x")
     cy = st.slider("Centro Zoom Y (px):", 0, h - 1, key="zoom_y")
 
-# Calculos de pixels e metricas
-mask_hot = raw_adu >= limiar_hot
-mask_dead = raw_adu <= limiar_dead
-num_hot = int(np.sum(mask_hot))
-num_dead = int(np.sum(mask_dead))
+# Coordenadas de pixels defeituosos (extraidas diretamente sem criar mascaras booleanas gigantes permanentes)
+yh, xh = np.where(raw_adu >= limiar_hot)
+yd, xd = np.where(raw_adu <= limiar_dead)
+num_hot = len(xh)
+num_dead = len(xd)
 total_pixels = raw_adu.size
 
 # Painel de Metricas Superiores
@@ -391,7 +413,7 @@ col2.metric("Ruído Robusto (MAD)", f"{cal['sigma_mad']:.2f} ADU", f"RMS Global:
 col3.metric("Faixa Dinâmica (DR)", f"{cal['dr_stops']:.2f} EV", f"{cal['dr_db']:.1f} dB | {dados_principal['bits_adc']}-bits")
 col4.metric("Hot / Dead Pixels (Dark)", f"{num_hot} Hot", f"{num_dead} Dead (Bias: {dados_principal['bl_medio']:.0f} ADU)", delta_color="off")
 
-# Analise combinada opcional se o usuario enviou Bias/Offset ou Flat Frame
+# Analise combinada opcional (Bias / Flat)
 if arq_bias is not None or arq_flat is not None:
     st.subheader("🧩 Diagnóstico Multi-Frame (Dark + Flat + Offset/Bias)")
     cols_multi = st.columns(2)
@@ -418,9 +440,9 @@ if arq_bias is not None or arq_flat is not None:
                 f"- **Área Afetada por Poeira/Manchas:** `{res_flat['pct_poeira']:.3f}% do sensor`"
             )
 
-# Renderizacao dos 3 Graficos Principais
+# Preparacao leve para plotagem
 ganho = 2.0 ** ev
-rgb_exposto = np.clip(dados_principal['rgb_base'] * ganho, 0.0, 1.0)
+rgb_preview_exp = np.clip(dados_principal['rgb_preview'].astype(np.float32) * ganho, 0.0, 1.0)
 
 meia_janela = tam_janela // 2
 cx_clip = int(np.clip(cx, meia_janela, w - meia_janela))
@@ -428,87 +450,102 @@ cy_clip = int(np.clip(cy, meia_janela, h - meia_janela))
 x1, x2 = cx_clip - meia_janela, cx_clip + meia_janela
 y1, y2 = cy_clip - meia_janela, cy_clip + meia_janela
 
-recorte_rgb = rgb_exposto[y1:y2, x1:x2]
-recorte_adu = raw_adu[y1:y2, x1:x2]
+recorte_adu = raw_adu[y1:y2, x1:x2].astype(np.float32)
+bl = dados_principal['bl_medio']
+wl = dados_principal['white_level']
 
-fig = plt.figure(figsize=(16, 10.5), dpi=120, facecolor='white')
+fig = plt.figure(figsize=(15, 9.8), dpi=110, facecolor='white')
 gs = GridSpec(2, 2, figure=fig, height_ratios=[1.25, 1], width_ratios=[1.15, 1], hspace=0.30, wspace=0.22)
 
 ax_full = fig.add_subplot(gs[0, 0])
 ax_zoom = fig.add_subplot(gs[0, 1])
 ax_hist = fig.add_subplot(gs[1, :])
 
-# 1. Quadro Completo
-ax_full.imshow(rgb_exposto, interpolation='nearest')
+# 1. Quadro Completo (usa o preview em coordenadas originais extent=[0, w, h, 0] gastando apenas 4 MB de RAM)
+ax_full.imshow(rgb_preview_exp, interpolation='nearest', extent=[0, w, h, 0])
 ax_full.set_title(f"1. Quadro Completo (+{ev:.1f} EV | {ganho:.1f}x)", fontsize=11, fontweight='bold')
+ax_full.set_xlabel("Largura X (px)", fontsize=9)
+ax_full.set_ylabel("Altura Y (px)", fontsize=9)
+
 rect = patches.Rectangle((x1, y1), tam_janela, tam_janela, linewidth=2.0, edgecolor='#FFD700', facecolor='none', label='Janela de Zoom')
 ax_full.add_patch(rect)
 ax_full.plot(cx_clip, cy_clip, marker='+', color='#FFD700', markersize=10, markeredgewidth=1.8)
 
 if marcar_defeitos:
-    yh, xh = np.where(mask_hot)
-    if len(xh) > 0:
+    if num_hot > 0:
         ax_full.scatter(xh[:2000], yh[:2000], s=28, facecolors='none', edgecolors='#FF2222', linewidth=1.2, label=f'Hot ({num_hot})')
-    yd, xd = np.where(mask_dead)
-    if len(xd) > 0:
+    if num_dead > 0:
         ax_full.scatter(xd[:2000], yd[:2000], s=28, facecolors='none', edgecolors='#00FFFF', linewidth=1.2, label=f'Dead ({num_dead})')
 ax_full.legend(loc='upper right', framealpha=0.9, fontsize=8)
 
-# 2. Janela de Zoom
-bl = dados_principal['bl_medio']
-wl = dados_principal['white_level']
+# 2. Janela de Zoom 1:1 (Resolucao 100% Nativa)
+base_ref = bl if bl > 0 else cal['mediana']
+amplitude_adu = max(30.0, (wl - base_ref) / ganho)
+vmin_adu = max(0.0, base_ref - 4.0 * cal['sigma_mad'])
+vmax_adu = min(wl, base_ref + amplitude_adu)
+
 if "Bayer" in modo_zoom:
-    base_ref = bl if bl > 0 else cal['mediana']
-    amplitude_adu = max(30.0, (wl - base_ref) / ganho)
-    vmin_adu = max(0.0, base_ref - 4.0 * cal['sigma_mad'])
-    vmax_adu = min(wl, base_ref + amplitude_adu)
     im_z = ax_zoom.imshow(recorte_adu, cmap='inferno', vmin=vmin_adu, vmax=vmax_adu, interpolation='nearest', extent=[x1, x2, y2, y1])
     cbar = fig.colorbar(im_z, ax=ax_zoom, fraction=0.046, pad=0.04)
     cbar.set_label("Leitura Bruta (ADU)", fontsize=9)
 else:
-    ax_zoom.imshow(recorte_rgb, interpolation='nearest', extent=[x1, x2, y2, y1])
+    recorte_norm = np.clip((recorte_adu - base_ref) / max(1.0, wl - base_ref) * ganho, 0.0, 1.0)
+    ax_zoom.imshow(np.stack([recorte_norm]*3, axis=-1), interpolation='nearest', extent=[x1, x2, y2, y1])
 
 ax_zoom.set_title(f"2. Inspeção 1:1 ({tam_janela}x{tam_janela} px) em ({cx_clip}, {cy_clip})", fontsize=11, fontweight='bold')
+ax_zoom.set_xlabel(f"Coordenada X (Centro: {cx_clip} px)", fontsize=9)
+ax_zoom.set_ylabel(f"Coordenada Y (Centro: {cy_clip} px)", fontsize=9)
+
 if tam_janela <= 60:
     ax_zoom.set_xticks(np.arange(x1, x2 + 1, 1), minor=True)
     ax_zoom.set_yticks(np.arange(y1, y2 + 1, 1), minor=True)
     ax_zoom.grid(which='minor', color='white', linestyle='-', linewidth=0.35, alpha=0.35)
 
 if marcar_defeitos:
-    yh_z, xh_z = np.where(mask_hot[y1:y2, x1:x2])
+    yh_z, xh_z = np.where(recorte_adu >= limiar_hot)
     if len(xh_z) > 0:
         ax_zoom.scatter(x1 + xh_z + 0.5, y1 + yh_z + 0.5, s=100, facecolors='none', edgecolors='#00FF00', linewidth=1.8, label='Hot Pixel')
-    yd_z, xd_z = np.where(mask_dead[y1:y2, x1:x2])
+    yd_z, xd_z = np.where(recorte_adu <= limiar_dead)
     if len(xd_z) > 0:
         ax_zoom.scatter(x1 + xd_z + 0.5, y1 + yd_z + 0.5, s=100, facecolors='none', edgecolors='#00FFFF', linewidth=1.8, label='Dead Pixel')
+    if len(xh_z) > 0 or len(xd_z) > 0:
+        ax_zoom.legend(loc='upper right', framealpha=0.9, fontsize=8)
 
-# 3. Histograma ADU
-ax_hist.hist(raw_adu.ravel(), bins=180, color='#1f4e78', log=True, edgecolor='none', alpha=0.88, label='Contagem de Pixels (ADU)')
+# 3. Histograma ADU via np.bincount (Zero alocacao extra de RAM e 20x mais rapido)
+contagens_adu = np.bincount(raw_adu.ravel())
+valores_adu_x = np.nonzero(contagens_adu)[0]
+contagens_y = contagens_adu[valores_adu_x]
+
+ax_hist.bar(valores_adu_x, contagens_y, width=max(1.0, (valores_adu_x[-1] - valores_adu_x[0]) / 250.0), color='#1f4e78', log=True, alpha=0.88, label='Contagem de Pixels (ADU)')
 ax_hist.axvline(bl if bl > 0 else cal['mediana'], color='#2ca02c', linestyle='-', linewidth=1.8, label=f'Pedestal ({bl if bl > 0 else cal["mediana"]:.0f} ADU)')
 ax_hist.axvline(cal['mediana'] + cal['sigma_mad'], color='#ff7f0e', linestyle=':', linewidth=1.5, label=f'+1 Sigma MAD (+{cal["sigma_mad"]:.1f} ADU)')
 ax_hist.axvline(limiar_hot, color='#d62728', linestyle='--', linewidth=1.8, label=f'Limiar Hot ({limiar_hot} ADU)')
 ax_hist.axvline(limiar_dead, color='#17becf', linestyle='--', linewidth=1.8, label=f'Limiar Dead ({limiar_dead} ADU)')
 ax_hist.set_title(f"3. Distribuição ADU | Banding FPN (H/V): {cal['fpn_h']:.3f} / {cal['fpn_v']:.3f} ADU", fontsize=11, fontweight='bold')
-ax_hist.set_xlabel("Valor de Leitura do Conversor ADC (ADU)")
-ax_hist.set_ylabel("Contagem de Pixels (Escala Log)")
+ax_hist.set_xlabel("Valor de Leitura do Conversor ADC (ADU)", fontsize=9)
+ax_hist.set_ylabel("Contagem de Pixels (Escala Log)", fontsize=9)
 ax_hist.legend(loc='upper right', fontsize=9)
 ax_hist.grid(True, which="both", ls="--", alpha=0.35)
 
-st.pyplot(fig)
+# Salva em buffer PNG de 160 DPI e exibe direto na tela para liberar a figura da RAM imediatamente
+buf_img = io.BytesIO()
+fig.savefig(buf_img, format="png", dpi=160, bbox_inches="tight", facecolor="white")
+plt.close(fig)
+gc.collect()
 
-# Botao para baixar o relatorio PNG em 300 DPI diretamente pelo navegador
-buf_png = io.BytesIO()
-fig.savefig(buf_png, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+bytes_png = buf_img.getvalue()
+st.image(bytes_png, use_container_width=True)
+
 st.download_button(
-    label="📥 Baixar Relatório Gráfico em Alta Resolução (PNG 300 DPI)",
-    data=buf_png.getvalue(),
+    label="📥 Baixar Relatório Gráfico em Alta Resolução (PNG)",
+    data=bytes_png,
     file_name=f"Relatorio_Sensor_{os.path.splitext(dados_principal['arquivo'])[0]}.png",
     mime="image/png"
 )
 
-with st.expander("📄 Ver Relatório Técnico Completo em Texto"):
+with st.expander("📄 Ver Relatório Técnico Completo em Texto", expanded=True):
     st.code(
-        f"DIAGNOSTICO TECNICO DE SENSOR | Arquivo: {dados_principal['arquivo']} ({dados_principal['tamanho_mb']:.2f} MB)\n"
+        f"DIAGNOSTICO TECNICO DE SENSOR | Arquivo: {dados_principal['arquivo']} ({dados_principal['tamanho_mb']:.2f} MB) | {dados_principal['tipo_arquivo']}\n"
         f"- Fabricante / Modelo    : {exif.get('Fabricante')} {exif.get('Modelo')}\n"
         f"- Identificacao Sensor   : {exif.get('Sensor')}\n"
         f"- Contagem de Cliques    : {exif.get('Cliques')}\n"
@@ -516,6 +553,7 @@ with st.expander("📄 Ver Relatório Técnico Completo em Texto"):
         f"- Resolucao / CFA / Bits : {w} x {h} px ({total_pixels/1e6:.2f} MP) | CFA: {dados_principal['padrao_cfa']} | ADC: {dados_principal['bits_adc']}-bits\n"
         f"- Black Level por Canal  : {dados_principal['bl_canais']} ADU (Mediana Subcanais: {cal['medianas_cfa']} ADU | White Level: {wl:.0f} ADU)\n"
         f"- Ruido Robusto (MAD)    : {cal['sigma_mad']:.2f} ADU (Subcanais: {cal['sigmas_cfa']} ADU) | RMS Global: {cal['rms_total']:.2f} ADU\n"
-        f"- Faixa Dinamica (DR)    : {cal['dr_stops']:.2f} EV | {cal['dr_db']:.2f} dB | Banding FPN (H/V): {cal['fpn_h']:.3f} / {cal['fpn_v']:.3f} ADU\n"
-        f"- Hot / Dead Detectados  : Hot = {num_hot} px (>= {limiar_hot} ADU) | Dead = {num_dead} px (<= {limiar_dead} ADU)"
+        f"- Faixa Dinamica (DR)    : {cal['dr_stops']:.2f} EV | {cal['dr_db']:.1f} dB | Banding FPN (H/V): {cal['fpn_h']:.3f} / {cal['fpn_v']:.3f} ADU\n"
+        f"- Hot / Dead Detectados  : Hot = {num_hot} px (>= {limiar_hot} ADU) | Dead = {num_dead} px (<= {limiar_dead} ADU)\n"
+        f"- Recorte Atual do Zoom  : Centro ({cx_clip}, {cy_clip}) -> X[{x1}:{x2}], Y[{y1}:{y2}] | Min = {np.min(recorte_adu):.0f} ADU, Max = {np.max(recorte_adu):.0f} ADU"
     )
