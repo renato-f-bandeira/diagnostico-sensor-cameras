@@ -1,4 +1,5 @@
 streamlit
+streamlit-image-coordinates
 rawpy
 opencv-python-headless
 numpy
@@ -6,3 +7,4 @@ matplotlib
 tifffile
 imagecodecs
 scipy
+pillow
