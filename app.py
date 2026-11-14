@@ -10,11 +10,18 @@ import cv2
 import rawpy
 import tifffile
 import imagecodecs
+from PIL import Image, ImageDraw
 from scipy.ndimage import median_filter, gaussian_filter
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.gridspec import GridSpec
 import streamlit as st
+
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    SUPORTA_CLIQUE_IMAGEM = True
+except ImportError:
+    SUPORTA_CLIQUE_IMAGEM = False
 
 st.set_page_config(
     page_title="Sistema de Metrologia e Diagnóstico de Sensores CMOS/CCD",
@@ -34,7 +41,6 @@ st.markdown("""
 # ==============================================================================
 # 1. BASE DE DADOS DE SENSORES HOMOLOGADOS E ESPECIFICACOES FISICAS
 # ==============================================================================
-# Define os parametros fisicos conhecidos de fabrica para garantir calibracao exata
 CATALOGO_SENSORES_HOMOLOGADOS = {
     "ILCE-7M3": {
         "nome_sensor": "Sony IMX410 (Full-Frame 24.2 MP BSI-CMOS)",
@@ -86,7 +92,6 @@ CATALOGO_SENSORES_HOMOLOGADOS = {
     }
 }
 
-# Inclui .nrw (Nikon Coolpix RAW) e demais extensoes RAW cientificas/comerciais
 EXTENSOES_RAW = ('.arw', '.cr2', '.cr3', '.nef', '.nrw', '.dng', '.orf', '.rw2', '.pef', '.raf', '.srw')
 
 # ==============================================================================
@@ -127,7 +132,6 @@ def extrair_metadados_exif(caminho_arquivo):
         fabricante = str(dados_fmt.get('Make', 'Desconhecido')).strip()
         modelo = str(dados_fmt.get('Model', 'Desconhecido')).strip()
 
-        # Busca correspondencia no catalogo homologado
         spec_homologada = None
         for mod_key, spec in CATALOGO_SENSORES_HOMOLOGADOS.items():
             if mod_key.upper() in modelo.upper():
@@ -198,7 +202,7 @@ def _ler_maior_subifd_dng(caminho_arquivo):
         melhor_matriz = tifffile.imread(caminho_arquivo)
     return melhor_matriz
 
-def _reduzir_para_preview(rgb_float, largura_max=1400):
+def _reduzir_para_preview(rgb_float, largura_max=900):
     h, w = rgb_float.shape[:2]
     if w > largura_max:
         fator = largura_max / float(w)
@@ -240,7 +244,6 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
         metodo_decodificacao = None
 
         if ext in EXTENSOES_RAW:
-            # 1a Via: LibRaw (rawpy) - Leitor cientifico primario (suporta .ARW, .NEF, .NRW, .CR2, .CR3, .ORF, .RW2)
             try:
                 with open(caminho_arquivo, 'rb') as f_bin:
                     with rawpy.imread(f_bin) as raw:
@@ -268,7 +271,6 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
                             metodo_decodificacao = "LibRaw_Linear3D"
                         del arr
 
-                        # Aplica fallback do catalogo se a camera estiver homologada e o LibRaw omitir White/Black Level
                         if spec_cat is not None:
                             if wl is None or wl <= 0:
                                 wl = spec_cat["white_level_padrao"]
@@ -287,7 +289,6 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
                             norm = np.clip((sub_raw - bl_m_temp) / max(1.0, wl_temp - bl_m_temp), 0.0, 1.0)
                             rgb_preview = _reduzir_para_preview(np.stack([norm] * 3, axis=-1))
             except Exception as erro_libraw:
-                # 2a Via: TiffFile + ImageCodecs (para containers DNG/TIFF com SubIFDs)
                 try:
                     arr = _ler_maior_subifd_dng(caminho_arquivo)
                     tipo_arquivo = "Container TIFF/DNG (SubIFD)"
@@ -319,12 +320,12 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
                         norm = np.clip((sub_raw - bl_m_temp) / max(1.0, wl_temp - bl_m_temp), 0.0, 1.0)
                         rgb_preview = _reduzir_para_preview(np.stack([norm] * 3, axis=-1))
                     del arr
-                except Exception as erro_tiff:
+                except Exception:
                     return {
                         'elegivel': False,
                         'motivo_rejeicao': (
-                            f"O arquivo '{nome_original}' ({exif.get('Fabricante')} {exif.get('Modelo')}) utiliza uma codificação proprietária "
-                            f"que não pôde ser descompactada sem perda metrológica (Detalhe LibRaw: {erro_libraw})."
+                            f"O arquivo '{nome_original}' ({exif.get('Fabricante')} {exif.get('Modelo')}) utiliza codificação proprietária "
+                            f"incompatível com extração metrológica direta (LibRaw: {erro_libraw})."
                         ),
                         'exif': exif
                     }
@@ -333,51 +334,39 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
                 'elegivel': False,
                 'motivo_rejeicao': (
                     f"O arquivo '{nome_original}' não é um arquivo RAW nativo de sensor (extensão '{ext}'). "
-                    f"Imagens processadas (JPEG, PNG, TIFF 8-bit) sofrem compressão, curva gama e subtração de pedestal, "
-                    f"tornando impossível a calibração confiável de ruído e pixels defeituosos."
+                    f"Imagens processadas não preservam leituras ADU lineares do conversor."
                 ),
                 'exif': exif
             }
 
-        # ==============================================================================
-        # PORTAO DE ELEGIBILIDADE E CONFIABILIDADE METROLOGICA DO SENSOR
-        # ==============================================================================
         motivos_invalidez = []
-
         if exigir_catalogo_estrito and not exif.get('Homologado_Catalogo', False):
             motivos_invalidez.append(
                 f"O modelo '{exif.get('Fabricante')} {exif.get('Modelo')}' ainda não consta no Catálogo de Sensores Homologados."
             )
 
-        # Verifica se o White Level e Black Level foram obtidos de forma autentica (sem chutes arbitrarios)
         if wl is None or wl <= 255:
             motivos_invalidez.append(
-                "Não foi possível extrair o limite de saturação ADC (White Level) autêntico dos metadados nem do catálogo, "
-                "ou os dados possuem profundidade insuficiente (8-bits)."
+                "Não foi possível extrair o limite de saturação ADC (White Level) autêntico dos metadados nem do catálogo."
             )
 
         if bl_canais is None:
             motivos_invalidez.append(
-                "O nível de pedestal eletrônico (Black Level por canal CFA) não está presente nos metadados do arquivo "
-                "e este sensor ainda não possui parâmetros de fábrica cadastrados no catálogo."
+                "O nível de pedestal eletrônico (Black Level) não está presente nos metadados e este sensor ainda não consta no catálogo."
             )
 
-        # Se o sensor nao esta no catalogo homologado e apresenta Black Level = 0 (pedestal cortado no zero),
-        # avisa que a calibracao automatica nao e confiavel sem os parametros fisicos do modelo no catalogo
         bl_medio = float(np.mean(bl_canais)) if bl_canais else 0.0
-        mediana_obs = float(np.median(raw_adu))
         fracao_zeros = float(np.sum(raw_adu == 0)) / raw_adu.size
 
         if not exif.get('Homologado_Catalogo', False):
             if bl_medio == 0.0 and fracao_zeros > 0.15:
                 motivos_invalidez.append(
-                    f"O sensor '{exif.get('Fabricante')} {exif.get('Modelo')}' não está no catálogo homologado e grava arquivos com "
-                    f"subtração prévia de nível de preto (Black Level = 0 ADU, com {fracao_zeros*100:.1f}% dos pixels truncados em zero). "
-                    f"Sem a curva de calibração específica deste sensor no catálogo, o cálculo de ruído e Dead Pixels seria impreciso."
+                    f"O sensor '{exif.get('Fabricante')} {exif.get('Modelo')}' ainda não está no catálogo e grava arquivos com "
+                    f"Black Level truncado em 0 ADU ({fracao_zeros*100:.1f}% dos pixels zerados), impedindo calibração autônoma confiável."
                 )
             if padrao_cfa in ('N/A', 'Desconhecido', '') and metodo_decodificacao != "LibRaw_Linear3D":
                 motivos_invalidez.append(
-                    f"A matriz de filtro de cor (CFA Pattern) do modelo '{exif.get('Fabricante')} {exif.get('Modelo')}' não pôde ser identificada."
+                    f"O padrão CFA do modelo '{exif.get('Fabricante')} {exif.get('Modelo')}' não pôde ser identificado."
                 )
 
         if motivos_invalidez:
@@ -414,10 +403,28 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
             os.remove(caminho_arquivo)
 
 # ==============================================================================
-# 3. MOTOR DE METROLOGIA: DARK, OFFSET/BIAS E FLAT FRAME (COM SUPORTE A BIAS ZERO)
+# 3. MOTOR DE METROLOGIA: SEPARACAO DE CAUDA TERMICA CONTINUA E HOT PIXELS REAIS
 # ==============================================================================
 
-def analisar_dark_e_bias(dados_dark, dados_bias=None, k_sigma_hot=15.0, k_sigma_warm=8.0):
+def _encontrar_fim_cauda_termica_continua(raw_adu, pedestal_ref, wl, sigma_mad):
+    """
+    Localiza onde o histograma continuo do ruido termico se extingue (o fim do 'ombro' da distribuicao de escuro)
+    para separar Warm Pixels (cauda termica normal de 30s) de verdadeiros Hot Pixels estruturais/visiveis!
+    """
+    contagens = np.bincount(raw_adu.ravel(), minlength=int(wl) + 1)
+    # Agrupa em bins de 32 ADU acima do pedestal para achar onde a densidade cai abaixo de 5 pixels por bin
+    inicio_busca = int(pedestal_ref + 6.0 * sigma_mad)
+    largura_bin = max(16, int((wl - pedestal_ref) / 250))
+
+    fim_cauda = int(pedestal_ref + 25.0 * sigma_mad)
+    for b_ini in range(inicio_busca, int(wl) - largura_bin, largura_bin):
+        soma_bin = int(np.sum(contagens[b_ini:b_ini + largura_bin]))
+        if soma_bin <= 3:
+            fim_cauda = b_ini
+            break
+    return fim_cauda
+
+def analisar_dark_e_bias(dados_dark, dados_bias=None):
     raw_dark = dados_dark['raw_adu']
     bl_medio = dados_dark['bl_medio']
     wl = dados_dark['white_level']
@@ -439,14 +446,9 @@ def analisar_dark_e_bias(dados_dark, dados_bias=None, k_sigma_hot=15.0, k_sigma_
             sub = raw_dark[r::2, c::2]
             med_c = float(np.median(sub))
             if bias_clipado and med_c <= passo_adc:
-                # Para sensores homologados com pedestal clipado em zero (ex: Nikon P1000 .NRW),
-                # estima o sigma robusto a partir da meia-normal direita (percentil 68.27% dos pixels > 0)
                 positivos = sub[sub > 0]
-                if len(positivos) > 100:
-                    q68 = float(np.percentile(positivos, 68.27))
-                    sigma_c = max(float(passo_adc), q68)
-                else:
-                    sigma_c = max(float(passo_adc), float(np.std(sub)))
+                q68 = float(np.percentile(positivos, 68.27)) if len(positivos) > 100 else float(np.std(sub))
+                sigma_c = max(float(passo_adc), q68)
             else:
                 mad_c = float(np.median(np.abs(sub.astype(np.float32) - med_c)))
                 sigma_c = 1.4826 * max(mad_c, float(passo_adc) * 0.5)
@@ -469,14 +471,18 @@ def analisar_dark_e_bias(dados_dark, dados_bias=None, k_sigma_hot=15.0, k_sigma_
     dr_stops = float(np.log2(excursao_util / sigma_mad))
     dr_db = float(20.0 * np.log10(excursao_util / sigma_mad))
 
-    margem_warm = max(k_sigma_warm * sigma_mad, excursao_util * 0.012)
-    limiar_warm_auto = int(min(wl, pedestal_ref + margem_warm))
+    # 1. Limiar de Warm Pixel: inicio da cauda termica assimetrica (>= Pedestal + 12*Sigma_MAD ou 3.5% da excursao)
+    fim_cauda_continua = _encontrar_fim_cauda_termica_continua(raw_dark, pedestal_ref, wl, sigma_mad)
+    limiar_warm_auto = int(min(wl * 0.5, max(pedestal_ref + 12.0 * sigma_mad, pedestal_ref + excursao_util * 0.035)))
 
-    margem_hot = max(k_sigma_hot * sigma_mad, excursao_util * 0.035)
-    limiar_hot_auto = int(min(wl, pedestal_ref + margem_hot))
+    # 2. Limiar de Hot Pixel Severo (Defeito / Visivel ja em +1.5 EV):
+    # Posicionado APOS o fim da cauda termica continua E com no minimo 15% da excursao util acima do Bias
+    # (Em +1.5 EV, 15% * 2.82 = 42% de brilho na tela, garantindo que todo Hot Pixel marcado seja claramente brilhante!)
+    minimo_visivel_15ev = pedestal_ref + excursao_util * 0.15
+    limiar_hot_auto = int(min(wl * 0.95, max(fim_cauda_continua, minimo_visivel_15ev)))
+    if limiar_warm_auto >= limiar_hot_auto:
+        limiar_warm_auto = int(pedestal_ref + (limiar_hot_auto - pedestal_ref) * 0.45)
 
-    # Se o sensor possui pedestal > 20 ADU, pode detectar Dead Pixel por colapso de Bias no Dark.
-    # Se o sensor ja grava Black Level = 0 ADU (como Nikon NRW), avisa que Dead Pixels exigem Flat Frame.
     if pedestal_ref > 20.0 and not bias_clipado:
         limiar_dead_auto = int(max(0.0, min(pedestal_ref * 0.25, mediana_global - 12.0 * max(sigma_mad, rms_total))))
         suporta_dead_no_dark = True
@@ -584,10 +590,10 @@ def analisar_flat_frame_profissional(dados_flat, dados_bias=None, limiar_dead_re
             qtd_d = int(np.sum(mask_dead_sub))
             num_dead_flat += qtd_d
 
-            if qtd_d > 0 and len(coordenadas_dead_flat_x) < 2000:
+            if qtd_d > 0 and len(coordenadas_dead_flat_x) < 1500:
                 yy, xx = np.where(mask_dead_sub)
-                coordenadas_dead_flat_x.extend((xx * 2 + c)[:2000 - len(coordenadas_dead_flat_x)])
-                coordenadas_dead_flat_y.extend((yy * 2 + r)[:2000 - len(coordenadas_dead_flat_y)])
+                coordenadas_dead_flat_x.extend((xx * 2 + c)[:1500 - len(coordenadas_dead_flat_x)])
+                coordenadas_dead_flat_y.extend((yy * 2 + r)[:1500 - len(coordenadas_dead_flat_y)])
 
             sub_sem_ruido = gaussian_filter(vizinhanca_3x3, sigma=2.0)
             perfil_vinhetagem = np.maximum(1.0, gaussian_filter(vizinhanca_3x3, sigma=35.0))
@@ -624,6 +630,34 @@ def baixar_exemplo_github(nome_arq):
     with urllib.request.urlopen(req, timeout=25) as resp:
         return resp.read()
 
+def gerar_imagem_mapa_clicavel(rgb_preview_exp, w_real, h_real, x1, y1, tam_janela, cx_clip, cy_clip, xh_top, yh_top, xd_top, yd_top, marcar_defeitos):
+    """Desenha o Mapa Global em um objeto PIL Image para permitir clique interativo via streamlit_image_coordinates."""
+    hp, wp = rgb_preview_exp.shape[:2]
+    esc_x = wp / float(w_real)
+    esc_y = hp / float(h_real)
+
+    arr_u8 = (np.clip(rgb_preview_exp, 0.0, 1.0) * 255.0).astype(np.uint8)
+    pil_img = Image.fromarray(arr_u8)
+    draw = ImageDraw.Draw(pil_img)
+
+    if marcar_defeitos:
+        for px, py in zip(xh_top, yh_top):
+            ix, iy = int(px * esc_x), int(py * esc_y)
+            draw.ellipse([ix - 3, iy - 3, ix + 3, iy + 3], outline=(230, 57, 70), width=1)
+        for px, py in zip(xd_top, yd_top):
+            ix, iy = int(px * esc_x), int(py * esc_y)
+            draw.ellipse([ix - 3, iy - 3, ix + 3, iy + 3], outline=(0, 180, 216), width=1)
+
+    rx1, ry1 = int(x1 * esc_x), int(y1 * esc_y)
+    rx2, ry2 = max(rx1 + 6, int((x1 + tam_janela) * esc_x)), max(ry1 + 6, int((y1 + tam_janela) * esc_y))
+    draw.rectangle([rx1, ry1, rx2, ry2], outline=(255, 215, 0), width=2)
+
+    icx, icy = int(cx_clip * esc_x), int(cy_clip * esc_y)
+    draw.line([icx - 6, icy, icx + 6, icy], fill=(255, 215, 0), width=2)
+    draw.line([icx, icy - 6, icx, icy + 6], fill=(255, 215, 0), width=2)
+
+    return pil_img, wp, hp
+
 # ==============================================================================
 # 4. INTERFACE TECNICA PROFISSIONAL (STREAMLIT)
 # ==============================================================================
@@ -644,7 +678,7 @@ with st.sidebar:
     exigir_catalogo = st.checkbox(
         "Restringir avaliação apenas a modelos do Catálogo Homologado",
         value=False,
-        help="Quando marcado, bloqueia qualquer modelo de câmera que não esteja cadastrado explicitamente em CATALOGO_SENSORES_HOMOLOGADOS, mesmo que o arquivo RAW possua metadados completos."
+        help="Quando marcado, bloqueia qualquer modelo de câmera que não esteja cadastrado explicitamente em CATALOGO_SENSORES_HOMOLOGADOS."
     )
 
     with st.expander("Modelos Homologados no Catálogo"):
@@ -687,22 +721,21 @@ if dados_dark is None:
     st.info("Selecione um arquivo RAW de Dark Frame na barra lateral esquerda (ou escolha uma amostra do banco de referência) para iniciar a avaliação.")
     st.stop()
 
-# Exibe bloqueio formal caso o sensor/camera nao esteja apto ou nao conste no catalogo confiavel
 if not dados_dark.get('elegivel', False):
     exif_rej = dados_dark.get('exif', {})
     st.error(
         f"**Modelo de Câmera/Sensor Não Homologado ou Incompatível para Avaliação Confiável**\n\n"
         f"- **Equipamento Identificado:** `{exif_rej.get('Fabricante', 'Desconhecido')} {exif_rej.get('Modelo', 'Desconhecido')}`\n"
         f"- **Diagnóstico de Elegibilidade:** {dados_dark.get('motivo_rejeicao')}\n\n"
-        f"Este modelo de sensor/câmera ainda não possui parâmetros de calibração validados no catálogo da plataforma (ou o arquivo não preserva dados brutos lineares suficientes) e, por segurança metrológica, não pode ser avaliado."
+        f"Este modelo de sensor/câmera ainda não está no catálogo homologado da plataforma (ou seus dados não permitem calibração confiável) e não pode ser avaliado."
     )
     st.stop()
 
 if not dados_dark['exif'].get('Homologado_Catalogo', False):
     st.warning(
         f"**Aviso de Calibração Autônoma:** O modelo `{dados_dark['exif'].get('Fabricante')} {dados_dark['exif'].get('Modelo')}` "
-        f"ainda não consta nominalmente no catálogo fixo, mas passou na auditoria física porque seu arquivo RAW forneceu "
-        f"diretamente os parâmetros nativos de fábrica (Black Level = `{dados_dark['bl_canais']} ADU`, White Level = `{dados_dark['white_level']:.0f} ADU`, CFA = `{dados_dark['padrao_cfa']}`)."
+        f"ainda não consta nominalmente no catálogo fixo, mas foi aceito na auditoria física porque seu arquivo RAW forneceu "
+        f"os parâmetros nativos de fábrica (Black Level = `{dados_dark['bl_canais']} ADU`, White Level = `{dados_dark['white_level']:.0f} ADU`, CFA = `{dados_dark['padrao_cfa']}`)."
     )
 
 h, w = dados_dark['raw_adu'].shape
@@ -721,6 +754,11 @@ res_flat = analisar_flat_frame_profissional(dados_flat, dados_bias) if dados_fla
 raw_adu = dados_dark['raw_adu']
 wl_int = int(max(255, dados_dark['white_level']))
 
+if "zoom_x" not in st.session_state or st.session_state.get("arq_atual") != dados_dark['arquivo']:
+    st.session_state.zoom_x = w // 2
+    st.session_state.zoom_y = h // 2
+    st.session_state.arq_atual = dados_dark['arquivo']
+
 with st.sidebar:
     st.divider()
     st.header("2. Parâmetros de Inspeção")
@@ -732,7 +770,7 @@ with st.sidebar:
         quadros_disponiveis.append("Offset / Bias Frame")
 
     quadro_visualizado = st.selectbox("Quadro exibido no Mapa Visual:", quadros_disponiveis)
-    ev = st.slider("Ganho Visual de Exposição (EV):", -2.0, 12.0, 4.0, 0.5)
+    ev = st.slider("Ganho Visual de Exposição (EV):", -2.0, 12.0, 1.5, 0.5)
     modo_zoom = st.selectbox("Renderização da Janela de Zoom:", ["Matriz Bayer Bruta 1:1 (ADU)", "Escala Linear Normalizada"])
     tam_janela = st.selectbox("Dimensão do Recorte de Zoom (px):", [30, 60, 120, 300], index=1)
     marcar_defeitos = st.checkbox("Sobrepor marcadores de pixels anômalos", value=True)
@@ -740,7 +778,7 @@ with st.sidebar:
     st.subheader("Limiares de Detecção (ADU)")
     limiar_hot = st.slider(
         "Limiar Hot Pixel Severo (ADU):", 0, wl_int, int(cal['limiar_hot_auto']),
-        help="Acima de Mediana + 15 Sigmas MAD (fuga térmica estrutural)."
+        help="Calculado automaticamente após o fim da cauda térmica contínua (visível mesmo em baixo EV)."
     )
     if cal['suporta_dead_no_dark']:
         max_dead_slider = max(50, int(dados_dark['bl_medio'] * 1.2))
@@ -753,11 +791,6 @@ with st.sidebar:
         st.caption("Nota Técnica: Este sensor grava arquivos RAW com Black Level = 0 ADU. A detecção de Dead Pixels requer o envio de um Flat Frame.")
 
     st.subheader("Coordenadas de Inspeção (X, Y)")
-    if "zoom_x" not in st.session_state or st.session_state.get("arq_atual") != dados_dark['arquivo']:
-        st.session_state.zoom_x = w // 2
-        st.session_state.zoom_y = h // 2
-        st.session_state.arq_atual = dados_dark['arquivo']
-
     if st.button("Centralizar no Pixel de Maior Sinal (Hot)"):
         idx_max = int(np.argmax(raw_adu))
         ym, xm = np.unravel_index(idx_max, raw_adu.shape)
@@ -767,8 +800,15 @@ with st.sidebar:
     cx = st.slider("Coordenada X (px):", 0, w - 1, key="zoom_x")
     cy = st.slider("Coordenada Y (px):", 0, h - 1, key="zoom_y")
 
-yh, xh = np.where(raw_adu >= limiar_hot)
-num_hot = len(xh)
+# Coordenadas de Hot Pixels ordenadas pelos mais brilhantes de toda a imagem (evita concentrar marcadores no topo)
+yh_all, xh_all = np.where(raw_adu >= limiar_hot)
+num_hot = len(xh_all)
+if num_hot > 1200:
+    vals_hot = raw_adu[yh_all, xh_all]
+    idx_top = np.argsort(vals_hot)[::-1][:1200]
+    xh_plot, yh_plot = xh_all[idx_top], yh_all[idx_top]
+else:
+    xh_plot, yh_plot = xh_all, yh_all
 
 limiar_warm_efetivo = min(limiar_hot, cal['limiar_warm_auto'])
 num_warm = int(np.sum((raw_adu >= limiar_warm_efetivo) & (raw_adu < limiar_hot)))
@@ -795,14 +835,14 @@ if res_flat is not None:
     col4.metric(
         "Defeitos Pontuais (Hot / Dead)",
         f"{num_hot} Hot | {res_flat['num_dead_flat']} Dead (Flat)",
-        f"Warm Pixels: {num_warm} px",
+        f"Warm Pixels (Cauda): {num_warm} px",
         delta_color="off"
     )
 else:
     col4.metric(
         "Anomalias no Dark (Hot / Warm)",
-        f"{num_hot} Hot Pixels",
-        f"Warm: {num_warm} | Dead: {str_dead_dark}",
+        f"{num_hot} Hot Severos",
+        f"Warm (Cauda): {num_warm} | Dead: {str_dead_dark}",
         delta_color="off"
     )
 
@@ -860,14 +900,42 @@ ganho = 2.0 ** ev
 rgb_preview_exp = np.clip(dados_vis['rgb_preview'].astype(np.float32) * ganho, 0.0, 1.0)
 
 meia_janela = tam_janela // 2
-cx_clip = int(np.clip(cx, meia_janela, w - meia_janela))
-cy_clip = int(np.clip(cy, meia_janela, h - meia_janela))
+cx_clip = int(np.clip(st.session_state.zoom_x, meia_janela, w - meia_janela))
+cy_clip = int(np.clip(st.session_state.zoom_y, meia_janela, h - meia_janela))
 x1, x2 = cx_clip - meia_janela, cx_clip + meia_janela
 y1, y2 = cy_clip - meia_janela, cy_clip + meia_janela
 
+# --- NAVEGACAO INTERATIVA POR CLIQUE DIRETO NO MAPA GLOBAL ---
+xd_mapa = res_flat['coords_dead_x'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else xd_dark[:1200]
+yd_mapa = res_flat['coords_dead_y'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else yd_dark[:1200]
+
+if SUPORTA_CLIQUE_IMAGEM:
+    st.subheader("Navegação Interativa de Inspeção (Clique sobre o Mapa Global à esquerda para mover o Zoom)")
+    col_mapa_click, col_info_click = st.columns([1.35, 1])
+    with col_mapa_click:
+        pil_mapa, wp_prev, hp_prev = gerar_imagem_mapa_clicavel(
+            rgb_preview_exp, w, h, x1, y1, tam_janela, cx_clip, cy_clip, xh_plot, yh_plot, xd_mapa, yd_mapa, marcar_defeitos
+        )
+        coords_click = streamlit_image_coordinates(pil_mapa, key=f"mapa_interativo_{dados_vis['arquivo']}")
+        if coords_click is not None:
+            novo_cx = int(np.clip(round(coords_click["x"] / float(wp_prev) * w), meia_janela, w - meia_janela))
+            novo_cy = int(np.clip(round(coords_click["y"] / float(hp_prev) * h), meia_janela, h - meia_janela))
+            if novo_cx != st.session_state.zoom_x or novo_cy != st.session_state.zoom_y:
+                st.session_state.zoom_x = novo_cx
+                st.session_state.zoom_y = novo_cy
+                st.rerun()
+    with col_info_click:
+        st.markdown(
+            f"**Coordenada Selecionada:** Centro `({cx_clip}, {cy_clip})` | Janela `X[{x1}:{x2}]`, `Y[{y1}:{y2}]`\n\n"
+            f"- **Leitura no Pixel Central Clicado:** `{raw_vis[cy_clip, cx_clip]} ADU`\n"
+            f"- **Mínimo / Máximo na Janela de Zoom:** `{np.min(raw_vis[y1:y2, x1:x2])} ADU` / `{np.max(raw_vis[y1:y2, x1:x2])} ADU`\n"
+            f"- **Limiar de Hot Pixel Severo:** `>= {limiar_hot} ADU` (`{num_hot}` pixels detectados acima da cauda térmica contínua)\n"
+            f"- **Faixa de Warm Pixels (Cauda Térmica):** `{limiar_warm_efetivo}` a `{limiar_hot} ADU` (`{num_warm}` pixels)"
+        )
+
 recorte_adu = raw_vis[y1:y2, x1:x2].astype(np.float32)
 
-# --- PLOTAGEM DOS 3 PAINEIS TECNICOS ---
+# --- PLOTAGEM DO LAUDO COMPLETO (3 PAINEIS) ---
 fig = plt.figure(figsize=(15, 9.8), dpi=115, facecolor='white')
 gs = GridSpec(2, 2, figure=fig, height_ratios=[1.25, 1], width_ratios=[1.15, 1], hspace=0.32, wspace=0.22)
 
@@ -886,22 +954,22 @@ ax_full.plot(cx_clip, cy_clip, marker='+', color='#FFD700', markersize=9, marker
 
 if marcar_defeitos:
     if num_hot > 0:
-        ax_full.scatter(xh[:1500], yh[:1500], s=24, facecolors='none', edgecolors='#E63946', linewidth=1.1, label=f'Hot Severo ({num_hot})')
-    if res_flat is not None and res_flat['num_dead_flat'] > 0:
-        ax_full.scatter(res_flat['coords_dead_x'], res_flat['coords_dead_y'], s=24, facecolors='none', edgecolors='#00B4D8', linewidth=1.1, label=f'Dead Flat ({res_flat["num_dead_flat"]})')
-    elif num_dead_dark > 0:
-        ax_full.scatter(xd_dark[:1500], yd_dark[:1500], s=24, facecolors='none', edgecolors='#00B4D8', linewidth=1.1, label=f'Dead Dark ({num_dead_dark})')
+        ax_full.scatter(xh_plot, yh_plot, s=24, facecolors='none', edgecolors='#E63946', linewidth=1.1, label=f'Hot Severo ({num_hot})')
+    if len(xd_mapa) > 0:
+        lbl_d = f'Dead Flat ({res_flat["num_dead_flat"]})' if (res_flat is not None and res_flat['num_dead_flat'] > 0) else f'Dead Dark ({num_dead_dark})'
+        ax_full.scatter(xd_mapa, yd_mapa, s=24, facecolors='none', edgecolors='#00B4D8', linewidth=1.1, label=lbl_d)
 ax_full.legend(loc='upper right', framealpha=0.92, fontsize=8)
 
+# Escala da Janela de Zoom sincronizada com o ganho EV para refletir fielmente o brilho visual
 base_ref = bl_vis if bl_vis > 0 else cal_vis['mediana']
 amplitude_adu = max(30.0, (wl_vis - base_ref) / ganho)
-vmin_adu = max(0.0, base_ref - 4.0 * cal_vis['sigma_mad'])
+vmin_adu = max(0.0, base_ref - 2.0 * cal_vis['sigma_mad'])
 vmax_adu = min(wl_vis, base_ref + amplitude_adu)
 
 if "Bayer" in modo_zoom:
     im_z = ax_zoom.imshow(recorte_adu, cmap='inferno', vmin=vmin_adu, vmax=vmax_adu, interpolation='nearest', extent=[x1, x2, y2, y1])
     cbar = fig.colorbar(im_z, ax=ax_zoom, fraction=0.046, pad=0.04)
-    cbar.set_label("Leitura ADU", fontsize=8.5)
+    cbar.set_label("Leitura ADU (Escala EV)", fontsize=8.5)
 else:
     recorte_norm = np.clip((recorte_adu - base_ref) / max(1.0, wl_vis - base_ref) * ganho, 0.0, 1.0)
     ax_zoom.imshow(np.stack([recorte_norm]*3, axis=-1), interpolation='nearest', extent=[x1, x2, y2, y1])
@@ -918,7 +986,7 @@ if tam_janela <= 60:
 if marcar_defeitos:
     yh_z, xh_z = np.where(raw_adu[y1:y2, x1:x2] >= limiar_hot)
     if len(xh_z) > 0:
-        ax_zoom.scatter(x1 + xh_z + 0.5, y1 + yh_z + 0.5, s=90, facecolors='none', edgecolors='#2EC4B6', linewidth=1.6, label='Hot Pixel')
+        ax_zoom.scatter(x1 + xh_z + 0.5, y1 + yh_z + 0.5, s=90, facecolors='none', edgecolors='#2EC4B6', linewidth=1.6, label='Hot Severo')
     if cal['suporta_dead_no_dark'] and limiar_dead >= 0:
         yd_z, xd_z = np.where(raw_adu[y1:y2, x1:x2] <= limiar_dead)
         if len(xd_z) > 0:
