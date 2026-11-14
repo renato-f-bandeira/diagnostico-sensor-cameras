@@ -1,5 +1,5 @@
 streamlit
-streamlit-image-coordinates
+ streamlit-image-coordinates
 rawpy
 opencv-python-headless
 numpy
