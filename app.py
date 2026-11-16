@@ -24,7 +24,7 @@ except ImportError:
     SUPORTA_CLIQUE_IMAGEM = False
 
 st.set_page_config(
-    page_title="Laboratório de Metrologia e Diagnóstico de Sensores",
+    page_title="Sistema de Metrologia e Diagnóstico de Sensores CMOS/CCD",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -158,8 +158,8 @@ def extrair_metadados_exif(caminho_arquivo):
             'Bits_EXIF': dados_num.get('BitsPerSample', 'N/A'),
             'Compression_EXIF': dados_fmt.get('Compression', dados_fmt.get('NikonCompression', 'N/A')),
             'CFA_EXIF': dados_fmt.get('CFAPattern', dados_fmt.get('CFAPattern2', 'N/A')),
-            'BlackLevel_EXIF': dados_num.get('BlackLevel', dados_fmt.get('BlackLevel', None)),
-            'WhiteLevel_EXIF': dados_num.get('WhiteLevel', None)
+            'BlackLevel_EXIF': dados_fmt.get('BlackLevel', dados_fmt.get('BlackLevel', None)),
+            'WhiteLevel_EXIF': dados_fmt.get('WhiteLevel', None)
         }
     except Exception as e:
         return {'Fabricante': 'Erro', 'Modelo': str(e), 'Homologado_Catalogo': False, 'Spec_Catalogo': None, 'Exposicao_Seg': 0.0, 'Exposicao_Str': 'N/A', 'ISO': 'N/A'}
@@ -382,10 +382,6 @@ def processar_arquivo_individual(file_bytes, nome_original, exigir_catalogo_estr
 
 @st.cache_data(max_entries=3, show_spinner=False)
 def processar_pilha_imagens(uploaded_files_list, exigir_catalogo_estrito=False):
-    """
-    Processa uma lista de ate 3 arquivos enviados pelo usuario e gera um 'Master Frame'
-    estatistico (mediana pixel a pixel para Dark/Flat e media para Bias) para eliminar ruido aleatorio e raios cosmicos.
-    """
     if not uploaded_files_list:
         return None
 
@@ -396,23 +392,18 @@ def processar_pilha_imagens(uploaded_files_list, exigir_catalogo_estrito=False):
             resultados_individuais.append(res_ind)
 
     if not resultados_individuais:
-        # Retorna o primeiro objeto com o erro de elegibilidade caso nenhum seja valido
         return processar_arquivo_individual(uploaded_files_list[0].getvalue(), uploaded_files_list[0].name, exigir_catalogo_estrito)
 
     if len(resultados_individuais) == 1:
         return resultados_individuais[0]
 
-    # Stacking (Master Frame): empilha as matrizes raw_adu
     h_ref, w_ref = resultados_individuais[0]['raw_adu'].shape
     pilha_arrays = []
     for r in resultados_individuais:
         if r['raw_adu'].shape == (h_ref, w_ref):
             pilha_arrays.append(r['raw_adu'].astype(np.float32))
 
-    # Usa mediana para rejeitar raios cosmicos em Darks/Flats
     master_raw = np.median(np.stack(pilha_arrays, axis=0), axis=0).astype(np.uint16)
-
-    # Usa o preview do primeiro arquivo da pilha
     master_dict = resultados_individuais[0].copy()
     master_dict['arquivo'] = f"Master Frame ({len(resultados_individuais)} quadros empilhados)"
     master_dict['raw_adu'] = master_raw
