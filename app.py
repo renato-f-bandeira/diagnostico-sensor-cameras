@@ -24,7 +24,7 @@ except ImportError:
     SUPORTA_CLIQUE_IMAGEM = False
 
 st.set_page_config(
-    page_title="Sistema de Metrologia e Diagnóstico de Sensores CMOS/CCD",
+    page_title="Laboratório de Metrologia e Diagnóstico de Sensores",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -95,7 +95,7 @@ CATALOGO_SENSORES_HOMOLOGADOS = {
 EXTENSOES_RAW = ('.arw', '.cr2', '.cr3', '.nef', '.nrw', '.dng', '.orf', '.rw2', '.pef', '.raf', '.srw')
 
 # ==============================================================================
-# 2. CAMADA DE LEITURA DE HARDWARE E VALIDACAO DE ELEGIBILIDADE METROLOGICA
+# 2. CAMADA DE LEITURA DE HARDWARE E PROCESSAMENTO DE STACK (MASTER FRAMES)
 # ==============================================================================
 
 def _parse_tempo_exposicao_segundos(val_num, val_fmt):
@@ -123,7 +123,7 @@ def extrair_metadados_exif(caminho_arquivo):
         dados_fmt = json.loads(res_fmt.stdout)[0] if res_fmt.stdout else {}
 
         chaves_shutter = ['ShutterCount', 'ImageCount', 'ShutterCount2', 'ShutterCount3', 'TotalShutterReleases', 'ImageNumber', 'ExposureCount']
-        cliques = "Nao disponivel nos metadados deste modelo"
+        cliques = "Nao disponivel"
         for chave in chaves_shutter:
             if chave in dados_num:
                 cliques = f"{dados_num[chave]} acionamentos ({chave})"
@@ -222,8 +222,7 @@ def _detectar_passo_quantizacao_adc(raw_adu):
             return max(1, passo)
     return 1
 
-@st.cache_data(max_entries=3, show_spinner=False)
-def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=False):
+def processar_arquivo_individual(file_bytes, nome_original, exigir_catalogo_estrito=False):
     ext = os.path.splitext(nome_original)[1].lower()
     tamanho_mb = len(file_bytes) / (1024.0 * 1024.0)
 
@@ -323,51 +322,30 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
                 except Exception:
                     return {
                         'elegivel': False,
-                        'motivo_rejeicao': (
-                            f"O arquivo '{nome_original}' ({exif.get('Fabricante')} {exif.get('Modelo')}) utiliza codificação proprietária "
-                            f"incompatível com extração metrológica direta (LibRaw: {erro_libraw})."
-                        ),
+                        'motivo_rejeicao': f"Falha na decodificação do RAW '{nome_original}' (LibRaw: {erro_libraw}).",
                         'exif': exif
                     }
         else:
             return {
                 'elegivel': False,
-                'motivo_rejeicao': (
-                    f"O arquivo '{nome_original}' não é um arquivo RAW nativo de sensor (extensão '{ext}'). "
-                    f"Imagens processadas não preservam leituras ADU lineares do conversor."
-                ),
+                'motivo_rejeicao': f"O arquivo '{nome_original}' não é um formato RAW compatível.",
                 'exif': exif
             }
 
         motivos_invalidez = []
         if exigir_catalogo_estrito and not exif.get('Homologado_Catalogo', False):
-            motivos_invalidez.append(
-                f"O modelo '{exif.get('Fabricante')} {exif.get('Modelo')}' ainda não consta no Catálogo de Sensores Homologados."
-            )
-
+            motivos_invalidez.append("Modelo de câmera não consta no Catálogo Homologado.")
         if wl is None or wl <= 255:
-            motivos_invalidez.append(
-                "Não foi possível extrair o limite de saturação ADC (White Level) autêntico dos metadados nem do catálogo."
-            )
-
+            motivos_invalidez.append("White Level ADC inválido.")
         if bl_canais is None:
-            motivos_invalidez.append(
-                "O nível de pedestal eletrônico (Black Level) não está presente nos metadados e este sensor ainda não consta no catálogo."
-            )
+            motivos_invalidez.append("Black Level por canal ausente.")
 
         bl_medio = float(np.mean(bl_canais)) if bl_canais else 0.0
         fracao_zeros = float(np.sum(raw_adu == 0)) / raw_adu.size
 
         if not exif.get('Homologado_Catalogo', False):
             if bl_medio == 0.0 and fracao_zeros > 0.15:
-                motivos_invalidez.append(
-                    f"O sensor '{exif.get('Fabricante')} {exif.get('Modelo')}' ainda não está no catálogo e grava arquivos com "
-                    f"Black Level truncado em 0 ADU ({fracao_zeros*100:.1f}% dos pixels zerados), impedindo calibração autônoma confiável."
-                )
-            if padrao_cfa in ('N/A', 'Desconhecido', '') and metodo_decodificacao != "LibRaw_Linear3D":
-                motivos_invalidez.append(
-                    f"O padrão CFA do modelo '{exif.get('Fabricante')} {exif.get('Modelo')}' não pôde ser identificado."
-                )
+                motivos_invalidez.append("Black Level truncado em 0 ADU sem parâmetro de catálogo correspondente.")
 
         if motivos_invalidez:
             return {
@@ -402,8 +380,49 @@ def processar_bytes_imagem(file_bytes, nome_original, exigir_catalogo_estrito=Fa
         if os.path.exists(caminho_arquivo):
             os.remove(caminho_arquivo)
 
+@st.cache_data(max_entries=3, show_spinner=False)
+def processar_pilha_imagens(uploaded_files_list, exigir_catalogo_estrito=False):
+    """
+    Processa uma lista de ate 3 arquivos enviados pelo usuario e gera um 'Master Frame'
+    estatistico (mediana pixel a pixel para Dark/Flat e media para Bias) para eliminar ruido aleatorio e raios cosmicos.
+    """
+    if not uploaded_files_list:
+        return None
+
+    resultados_individuais = []
+    for file_obj in uploaded_files_list[:3]:
+        res_ind = processar_arquivo_individual(file_obj.getvalue(), file_obj.name, exigir_catalogo_estrito)
+        if res_ind and res_ind.get('elegivel', False):
+            resultados_individuais.append(res_ind)
+
+    if not resultados_individuais:
+        # Retorna o primeiro objeto com o erro de elegibilidade caso nenhum seja valido
+        return processar_arquivo_individual(uploaded_files_list[0].getvalue(), uploaded_files_list[0].name, exigir_catalogo_estrito)
+
+    if len(resultados_individuais) == 1:
+        return resultados_individuais[0]
+
+    # Stacking (Master Frame): empilha as matrizes raw_adu
+    h_ref, w_ref = resultados_individuais[0]['raw_adu'].shape
+    pilha_arrays = []
+    for r in resultados_individuais:
+        if r['raw_adu'].shape == (h_ref, w_ref):
+            pilha_arrays.append(r['raw_adu'].astype(np.float32))
+
+    # Usa mediana para rejeitar raios cosmicos em Darks/Flats
+    master_raw = np.median(np.stack(pilha_arrays, axis=0), axis=0).astype(np.uint16)
+
+    # Usa o preview do primeiro arquivo da pilha
+    master_dict = resultados_individuais[0].copy()
+    master_dict['arquivo'] = f"Master Frame ({len(resultados_individuais)} quadros empilhados)"
+    master_dict['raw_adu'] = master_raw
+    master_dict['tamanho_mb'] = sum(r['tamanho_mb'] for r in resultados_individuais)
+
+    gc.collect()
+    return master_dict
+
 # ==============================================================================
-# 3. MOTOR DE METROLOGIA: DARK, BIAS E SEPARACAO FISICA DE DEAD PIXEL VS BAIXA SENSIBILIDADE
+# 3. MOTOR DE METROLOGIA: DARK, BIAS E STACK TERMICO
 # ==============================================================================
 
 def _encontrar_fim_cauda_termica_continua(raw_adu, pedestal_ref, wl, sigma_mad):
@@ -541,19 +560,7 @@ def analisar_dark_e_bias(dados_dark, dados_bias=None):
         'bias_cal': metricas_bias
     }
 
-def analisar_flat_frame_profissional(dados_flat, dados_bias=None, queda_baixa_sens_pct=0.35):
-    """
-    Distingue rigorosamente segundo a fisica de semicondutores (EMVA 1288):
-    1. True Dead Pixel (Pixel Fisicamente Morto / Inativo a Luz):
-       Nao gera fotoeletrons sob iluminacao. O sinal liquido (Leitura - Bias) permanece estagnado
-       dentro do piso de ruido de leitura (<= 3 * Sigma_Read_Noise ou <= 5% da luz local da vizinhanca 3x3).
-    2. Low-Sensitivity Pixel (Pixel Sub-Sensivel / Defeito Parcial PRNU):
-       O pixel AINDA responde a luz (sinal liquido acima do piso de escuro), mas apresenta eficiencia
-       quantica reduzida (cai mais de 'queda_baixa_sens_pct', ex: 35% abaixo dos 8 vizinhos da mesma cor
-       e simultaneamente fora de 7 desvios padrao locais da vizinhanca 3x3).
-    3. Sombra Optica de Poeira (Baixa frequencia espacial):
-       Regioes extensas suavizadas que apresentam atenuacao optica em relacao ao envelope da lente.
-    """
+def analisar_flat_frame_profissional(dados_flat, dados_bias=None, limiar_dead_rel=0.50, sigma_outlier_dead=10.0):
     raw_flat = dados_flat['raw_adu']
     wl = dados_flat['white_level']
     bl = dados_bias['bl_medio'] if (dados_bias is not None and dados_bias.get('elegivel') and dados_bias['bl_medio'] > 0) else dados_flat['bl_medio']
@@ -582,7 +589,6 @@ def analisar_flat_frame_profissional(dados_flat, dados_bias=None, queda_baixa_se
     coordenadas_dead_flat_x = []
     coordenadas_dead_flat_y = []
 
-    # Piso minimo de resposta eletrica para considerar que o fotodiodo reagiu a luz
     piso_inatividade_adu = max(12.0, float(dados_flat['passo_adc']) * 4.0)
 
     for r in range(2):
@@ -594,12 +600,10 @@ def analisar_flat_frame_profissional(dados_flat, dados_bias=None, queda_baixa_se
             mad_local = float(np.median(np.abs(diff_alta_freq)))
             sigma_alta_freq = max(1.0, 1.4826 * mad_local)
 
-            # 1. TRUE DEAD PIXEL: nao sinaliza luz (fica preso no piso de escuro <= piso_inatividade_adu ou <= 5% da luz local)
-            # enquanto a vizinhanca 3x3 esta iluminada (> 4 * piso_inatividade_adu) e desvia mais de 10 sigmas locais
             mask_dead_true = (
                 (vizinhanca_3x3 > 4.0 * piso_inatividade_adu) &
                 ((sub_liquido <= piso_inatividade_adu) | (sub_liquido <= 0.05 * vizinhanca_3x3)) &
-                (diff_alta_freq <= -10.0 * sigma_alta_freq)
+                (diff_alta_freq <= -sigma_outlier_dead * sigma_alta_freq)
             )
             qtd_d = int(np.sum(mask_dead_true))
             num_dead_verdadeiro += qtd_d
@@ -609,17 +613,13 @@ def analisar_flat_frame_profissional(dados_flat, dados_bias=None, queda_baixa_se
                 coordenadas_dead_flat_x.extend((xx * 2 + c)[:1500 - len(coordenadas_dead_flat_x)])
                 coordenadas_dead_flat_y.extend((yy * 2 + r)[:1500 - len(coordenadas_dead_flat_y)])
 
-            # 2. PIXEL DE BAIXA SENSIBILIDADE (Sub-Sensivel, mas NAO morto):
-            # Reage a luz (sub_liquido > piso_inatividade_adu), porem entrega menos de (1 - queda_baixa_sens_pct) da vizinhanca 3x3
-            # e cai abaixo de 7 desvios padrao do ruido fotonico local
             mask_sub_sensivel = (
                 (~mask_dead_true) &
-                (sub_liquido <= vizinhanca_3x3 * (1.0 - queda_baixa_sens_pct)) &
+                (sub_liquido <= vizinhanca_3x3 * 0.65) &
                 (diff_alta_freq <= -7.0 * sigma_alta_freq)
             )
             num_baixa_sensibilidade += int(np.sum(mask_sub_sensivel))
 
-            # 3. Sombra Optica de Poeira / Manchas
             sub_sem_ruido = gaussian_filter(vizinhanca_3x3, sigma=2.0)
             perfil_vinhetagem = np.maximum(1.0, gaussian_filter(vizinhanca_3x3, sigma=35.0))
             transmissao_optica = sub_sem_ruido / perfil_vinhetagem
@@ -686,136 +686,90 @@ def gerar_imagem_mapa_clicavel(rgb_preview_exp, w_real, h_real, x1, y1, tam_jane
     return pil_img, wp, hp
 
 # ==============================================================================
-# 4. INTERFACE TECNICA COM BOTAO DE EXECUCAO EM LOTE ("INICIAR DIAGNOSTICO")
+# 4. INTERFACE TECNICA COM ABAS DE NAVEGACAO (DIAGNOSTICO, COMPARACAO TERMICA E GLOSSARIO)
 # ==============================================================================
 
 st.title("Laboratório de Metrologia e Diagnóstico de Sensores")
-st.markdown(
-    "Plataforma de análise radiométrica de matrizes CMOS/CCD em leitura bruta (ADU). "
-    "Anexe os quadros desejados na barra lateral e clique em **Iniciar Diagnóstico Metrológico**."
-)
 
-if "analise_ativa" not in st.session_state:
-    st.session_state.analise_ativa = False
+tab_diag, tab_termico, tab_tutorial = st.tabs([
+    "Diagnóstico Principal",
+    "Comparação Térmica (Série Temporal)",
+    "Guia Didático e Glossário"
+] )
 
 with st.sidebar:
-    st.header("1. Seleção de Quadros RAW")
+    st.header("1. Seleção de Quadros RAW (Pilha de 1 a 3 imgs)")
     tipos_aceitos = ['arw', 'cr2', 'cr3', 'nef', 'nrw', 'dng', 'orf', 'rw2', 'pef', 'raf', 'srw']
-    arq_dark = st.file_uploader("Quadro 1: Dark Frame (Obrigatório - Lente Tampada)", type=tipos_aceitos)
-    arq_bias = st.file_uploader("Quadro 2: Offset / Bias Frame (Opcional - Exp. Mínima)", type=tipos_aceitos)
-    arq_flat = st.file_uploader("Quadro 3: Flat Frame (Opcional - Campo Uniforme)", type=tipos_aceitos)
+    arquivos_dark_up = st.file_uploader("Quadro 1: Dark Frame (Até 3 arquivos)", type=tipos_aceitos, accept_multiple_files=True)
+    arquivos_bias_up = st.file_uploader("Quadro 2: Offset / Bias Frame (Até 3 arquivos)", type=tipos_aceitos, accept_multiple_files=True)
+    arquivos_flat_up = st.file_uploader("Quadro 3: Flat Frame (Até 3 arquivos)", type=tipos_aceitos, accept_multiple_files=True)
 
+    st.divider()
     st.subheader("Ou usar Banco de Referência")
     exemplo_escolhido = st.selectbox(
         "Amostra oficial do repositório:",
         ["Nenhum (Usar meus arquivos)", "DSC02212.ARW (Sony ILCE-7M3)", "DSC00906.ARW (Sony ILCE-6000)"]
     )
 
-    exigir_catalogo = st.checkbox(
-        "Restringir apenas a modelos do Catálogo Homologado",
-        value=False
-    )
-
-    # Botao principal de execucao (evita reprocessar a cada upload individual)
+    exigir_catalogo = st.checkbox("Restringir apenas a modelos do Catálogo Homologado", value=False)
     btn_iniciar = st.button("Iniciar Diagnóstico Metrológico", type="primary", use_container_width=True)
-    if btn_iniciar:
-        st.session_state.analise_ativa = True
 
-    with st.expander("Modelos Homologados no Catálogo"):
-        for mod_k, info_s in CATALOGO_SENSORES_HOMOLOGADOS.items():
-            st.caption(f"**{mod_k}**: {info_s['nome_sensor']}")
-
-if not st.session_state.analise_ativa:
+if not btn_iniciar and "dados_dark_cache" not in st.session_state:
     st.info(
-        "Aguardando início: selecione seus arquivos **Dark Frame**, **Offset/Bias** e **Flat Frame** na barra lateral esquerda "
-        "(ou escolha uma amostra de referência) e clique no botão **Iniciar Diagnóstico Metrológico**."
+        "Instruções:\n"
+        "1. Selecione na barra lateral até 3 arquivos para cada tipo de quadro (Dark, Bias, Flat) ou escolha uma amostra de referência.\n"
+        "2. Clique no botão **Iniciar Diagnóstico Metrológico**.\n"
+        "3. Navegue entre as abas para ver o mapa global interativo, a degradação térmica ou o glossário explicativo."
     )
     st.stop()
 
-dados_dark = None
-dados_bias = None
-dados_flat = None
+if btn_iniciar:
+    try:
+        with st.spinner("Processando e empilhando quadros (Master Frames)..."):
+            if arquivos_dark_up:
+                st.session_state.dados_dark_cache = processar_pilha_imagens(arquivos_dark_up, exigir_catalogo)
+            elif exemplo_escolhido != "Nenhum (Usar meus arquivos)":
+                nome_ex = exemplo_escolhido.split(" ")[0]
+                bytes_ex = baixar_exemplo_github(nome_ex)
+                st.session_state.dados_dark_cache = processar_bytes_imagem(bytes_ex, nome_ex, exigir_catalogo)
+            else:
+                st.session_state.dados_dark_cache = None
 
-try:
-    if arq_dark is not None:
-        with st.spinner(f"Processando Dark Frame '{arq_dark.name}'..."):
-            dados_dark = processar_bytes_imagem(arq_dark.getvalue(), arq_dark.name, exigir_catalogo)
-    elif exemplo_escolhido != "Nenhum (Usar meus arquivos)":
-        nome_ex = exemplo_escolhido.split(" ")[0]
-        with st.spinner(f"Baixando e processando amostra '{nome_ex}'..."):
-            bytes_ex = baixar_exemplo_github(nome_ex)
-            dados_dark = processar_bytes_imagem(bytes_ex, nome_ex, exigir_catalogo)
+            if arquivos_bias_up:
+                st.session_state.dados_bias_cache = processar_pilha_imagens(arquivos_bias_up, exigir_catalogo)
+            else:
+                st.session_state.dados_bias_cache = None
 
-    if arq_bias is not None:
-        with st.spinner(f"Processando Offset/Bias Frame '{arq_bias.name}'..."):
-            dados_bias = processar_bytes_imagem(arq_bias.getvalue(), arq_bias.name, exigir_catalogo)
+            if arquivos_flat_up:
+                st.session_state.dados_flat_cache = processar_pilha_imagens(arquivos_flat_up, exigir_catalogo)
+            else:
+                st.session_state.dados_flat_cache = None
+    except Exception as erro_proc:
+        st.error(f"Erro no processamento dos arquivos: {erro_proc}")
+        st.stop()
 
-    if arq_flat is not None:
-        with st.spinner(f"Processando Flat Frame '{arq_flat.name}'..."):
-            dados_flat = processar_bytes_imagem(arq_flat.getvalue(), arq_flat.name, exigir_catalogo)
-except Exception as erro_leitura:
-    st.error(f"Falha na leitura do arquivo: {erro_leitura}")
-    st.stop()
+dados_dark = st.session_state.get("dados_dark_cache", None)
+dados_bias = st.session_state.get("dados_bias_cache", None)
+dados_flat = st.session_state.get("dados_flat_cache", None)
 
 if dados_dark is None:
-    st.warning("Nenhum Dark Frame foi selecionado. Anexe um arquivo Dark Frame ou selecione uma amostra na barra lateral e clique em Iniciar.")
+    st.warning("Nenhum Dark Frame válido foi carregado. Envie um arquivo Dark Frame na barra lateral e clique em Iniciar.")
     st.stop()
 
 if not dados_dark.get('elegivel', False):
     exif_rej = dados_dark.get('exif', {})
     st.error(
-        f"**Modelo de Câmera/Sensor Não Homologado ou Incompatível para Avaliação Confiável**\n\n"
-        f"- **Equipamento Identificado:** `{exif_rej.get('Fabricante', 'Desconhecido')} {exif_rej.get('Modelo', 'Desconhecido')}`\n"
-        f"- **Diagnóstico de Elegibilidade:** {dados_dark.get('motivo_rejeicao')}\n\n"
-        f"Este modelo de sensor/câmera ainda não está no catálogo homologado da plataforma e não pode ser avaliado."
+        f"**Modelo de Câmera/Sensor Não Homologado ou Incompatível**\n\n"
+        f"- **Equipamento:** `{exif_rej.get('Fabricante', 'Desconhecido')} {exif_rej.get('Modelo', 'Desconhecido')}`\n"
+        f"- **Motivo:** {dados_dark.get('motivo_rejeicao')}"
     )
     st.stop()
 
 h, w = dados_dark['raw_adu'].shape
 if dados_bias is not None and (not dados_bias.get('elegivel', False) or dados_bias['raw_adu'].shape != (h, w)):
-    st.warning("O arquivo de Offset/Bias enviado é incompatível ou possui resolução diferente do Dark Frame e foi desconsiderado.")
     dados_bias = None
 if dados_flat is not None and (not dados_flat.get('elegivel', False) or dados_flat['raw_adu'].shape != (h, w)):
-    st.warning("O arquivo de Flat Frame enviado é incompatível ou possui resolução diferente do Dark Frame e foi desconsiderado.")
     dados_flat = None
-
-# ==============================================================================
-# RESUMO DE EXPOSICAO E ISO DE CADA IMAGEM ENVIADA (NO TOPO DA ANALISE)
-# ==============================================================================
-st.subheader("Parâmetros de Captura dos Quadros Carregados (EXIF)")
-cols_exif = st.columns(3)
-
-ex_d = dados_dark['exif']
-with cols_exif[0]:
-    st.markdown(
-        f"**1. Dark Frame (`{dados_dark['arquivo']}`)**\n"
-        f"- **ISO:** `{ex_d.get('ISO')}` | **Exposição:** `{ex_d.get('Exposicao_Str')} s`\n"
-        f"- **Câmera:** `{ex_d.get('Fabricante')} {ex_d.get('Modelo')}`"
-    )
-
-with cols_exif[1]:
-    if dados_bias is not None:
-        ex_b = dados_bias['exif']
-        st.markdown(
-            f"**2. Offset / Bias (`{dados_bias['arquivo']}`)**\n"
-            f"- **ISO:** `{ex_b.get('ISO')}` | **Exposição:** `{ex_b.get('Exposicao_Str')} s`\n"
-            f"- **Câmera:** `{ex_b.get('Fabricante')} {ex_b.get('Modelo')}`"
-        )
-    else:
-        st.markdown("**2. Offset / Bias Frame**\n- *Não enviado nesta sessão*")
-
-with cols_exif[2]:
-    if dados_flat is not None:
-        ex_f = dados_flat['exif']
-        st.markdown(
-            f"**3. Flat Frame (`{dados_flat['arquivo']}`)**\n"
-            f"- **ISO:** `{ex_f.get('ISO')}` | **Exposição:** `{ex_f.get('Exposicao_Str')} s`\n"
-            f"- **Câmera:** `{ex_f.get('Fabricante')} {ex_f.get('Modelo')}`"
-        )
-    else:
-        st.markdown("**3. Flat Frame**\n- *Não enviado nesta sessão*")
-
-st.divider()
 
 cal = analisar_dark_e_bias(dados_dark, dados_bias)
 res_flat = analisar_flat_frame_profissional(dados_flat, dados_bias) if dados_flat is not None else None
@@ -823,343 +777,295 @@ res_flat = analisar_flat_frame_profissional(dados_flat, dados_bias) if dados_fla
 raw_adu = dados_dark['raw_adu']
 wl_int = int(max(255, dados_dark['white_level']))
 
-# Gerenciamento de coordenadas sem conflito de chave de widget (corrige StreamlitWidgetAlreadyInstantiatedError)
-if "centro_x" not in st.session_state or st.session_state.get("arq_ativo") != dados_dark['arquivo']:
-    st.session_state.centro_x = w // 2
-    st.session_state.centro_y = h // 2
-    st.session_state.arq_ativo = dados_dark['arquivo']
+# ==============================================================================
+# ABA 1: DIAGNOSTICO PRINCIPAL
+# ==============================================================================
+with tab_diag:
+    with st.sidebar:
+        st.divider()
+        st.header("Controles Visuais (Aba Principal)")
+        quadros_disp = ["Dark Frame (Principal)"]
+        if dados_flat is not None:
+            quadros_disp.append("Flat Frame (Iluminação)")
+        if dados_bias is not None:
+            quadros_disp.append("Offset / Bias Frame")
 
-with st.sidebar:
-    st.divider()
-    st.header("2. Parâmetros de Inspeção")
+        quadro_visualizado = st.selectbox("Quadro exibido no Mapa:", quadros_disp, key="qv_select")
+        ev = st.slider("Ganho Visual (EV):", -2.0, 12.0, 1.5, 0.5, key="ev_slider")
+        modo_zoom = st.selectbox("Zoom 1:1 Render:", ["Matriz Bayer Bruta 1:1 (ADU)", "Escala Linear Normalizada"], key="zoom_mode_sel")
+        tam_janela = st.selectbox("Tamanho Janela Recorte:", [30, 60, 120, 300], index=1, key="win_size_sel")
+        marcar_defeitos = st.checkbox("Sobrepor marcadores de defeitos", value=True, key="mark_def_chk")
 
-    quadros_disponiveis = ["Dark Frame (Principal)"]
-    if dados_flat is not None:
-        quadros_disponiveis.append("Flat Frame (Iluminação)")
-    if dados_bias is not None:
-        quadros_disponiveis.append("Offset / Bias Frame")
+        limiar_hot = st.slider("Limiar Hot Pixel Severo (ADU):", 0, wl_int, int(cal['limiar_hot_auto']), key="l_hot_sld")
+        if cal['suporta_dead_no_dark']:
+            max_d_sld = max(50, int(dados_dark['bl_medio'] * 1.2))
+            limiar_dead = st.slider("Limiar Dead Pixel no Dark (ADU):", 0, max_d_sld, int(cal['limiar_dead_auto']), key="l_dead_sld")
+        else:
+            limiar_dead = -1
 
-    quadro_visualizado = st.selectbox("Quadro exibido no Mapa Visual:", quadros_disponiveis)
-    ev = st.slider("Ganho Visual de Exposição (EV):", -2.0, 12.0, 1.5, 0.5)
-    modo_zoom = st.selectbox("Renderização da Janela de Zoom:", ["Matriz Bayer Bruta 1:1 (ADU)", "Escala Linear Normalizada"])
-    tam_janela = st.selectbox("Dimensão do Recorte de Zoom (px):", [30, 60, 120, 300], index=1)
-    marcar_defeitos = st.checkbox("Sobrepor marcadores de pixels anômalos", value=True)
+    st.subheader("Parâmetros de Captura dos Quadros Carregados (EXIF)")
+    cols_exif = st.columns(3)
+    ex_d = dados_dark['exif']
+    with cols_exif[0]:
+        st.markdown(f"**1. Dark Frame**\n- ISO: `{ex_d.get('ISO')}` | Exp: `{ex_d.get('Exposicao_Str')} s`\n- Câmera: `{ex_d.get('Fabricante')} {ex_d.get('Modelo')}`")
+    with cols_exif[1]:
+        if dados_bias is not None:
+            ex_b = dados_bias['exif']
+            st.markdown(f"**2. Offset / Bias**\n- ISO: `{ex_b.get('ISO')}` | Exp: `{ex_b.get('Exposicao_Str')} s`\n- Câmera: `{ex_b.get('Fabricante')} {ex_b.get('Modelo')}`")
+        else:
+            st.markdown("**2. Offset / Bias Frame**\n- *Não enviado*")
+    with cols_exif[2]:
+        if dados_flat is not None:
+            ex_f = dados_flat['exif']
+            st.markdown(f"**3. Flat Frame**\n- ISO: `{ex_f.get('ISO')}` | Exp: `{ex_f.get('Exposicao_Str')} s`\n- Câmera: `{ex_f.get('Fabricante')} {ex_f.get('Modelo')}`")
+        else:
+            st.markdown("**3. Flat Frame**\n- *Não enviado*")
 
-    st.subheader("Limiares de Detecção (ADU)")
-    limiar_hot = st.slider(
-        "Limiar Hot Pixel Severo (ADU):", 0, wl_int, int(cal['limiar_hot_auto']),
-        help="Calculado automaticamente após o fim da cauda térmica contínua (visível mesmo em +1.5 EV)."
-    )
-    if cal['suporta_dead_no_dark']:
-        max_dead_slider = max(50, int(dados_dark['bl_medio'] * 1.2))
-        limiar_dead = st.slider(
-            "Limiar Dead Pixel no Dark (ADU):", 0, max_dead_slider, int(cal['limiar_dead_auto']),
-            help="Pixels cujo circuito de pedestal entrou em colapso próximo de zero ADU."
-        )
+    yh_all, xh_all = np.where(raw_adu >= limiar_hot)
+    num_hot = len(xh_all)
+    if num_hot > 1200:
+        vals_hot = raw_adu[yh_all, xh_all]
+        idx_top = np.argsort(vals_hot)[::-1][:1200]
+        xh_plot, yh_plot = xh_all[idx_top], yh_all[idx_top]
     else:
-        limiar_dead = -1
-        st.caption("Nota Técnica: Este sensor grava arquivos RAW com Black Level = 0 ADU. A detecção de Dead Pixels requer o envio de um Flat Frame.")
+        xh_plot, yh_plot = xh_all, yh_all
 
-    st.subheader("Coordenadas de Inspeção (X, Y)")
-    if st.button("Centralizar no Pixel de Maior Sinal (Hot)"):
-        idx_max = int(np.argmax(raw_adu))
-        ym, xm = np.unravel_index(idx_max, raw_adu.shape)
-        st.session_state.centro_x = int(xm)
-        st.session_state.centro_y = int(ym)
+    limiar_warm_efetivo = min(limiar_hot, cal['limiar_warm_auto'])
+    num_warm = int(np.sum((raw_adu >= limiar_warm_efetivo) & (raw_adu < limiar_hot)))
 
-    # Sliders sem 'key' presa ao session_state direto: usam value=st.session_state.centro_x para permitir atualizacao tanto por clique quanto por barra!
-    novo_slider_x = st.slider("Coordenada X (px):", 0, w - 1, value=int(st.session_state.centro_x))
-    novo_slider_y = st.slider("Coordenada Y (px):", 0, h - 1, value=int(st.session_state.centro_y))
-    if novo_slider_x != st.session_state.centro_x or novo_slider_y != st.session_state.centro_y:
-        st.session_state.centro_x = novo_slider_x
-        st.session_state.centro_y = novo_slider_y
-
-yh_all, xh_all = np.where(raw_adu >= limiar_hot)
-num_hot = len(xh_all)
-if num_hot > 1200:
-    vals_hot = raw_adu[yh_all, xh_all]
-    idx_top = np.argsort(vals_hot)[::-1][:1200]
-    xh_plot, yh_plot = xh_all[idx_top], yh_all[idx_top]
-else:
-    xh_plot, yh_plot = xh_all, yh_all
-
-limiar_warm_efetivo = min(limiar_hot, cal['limiar_warm_auto'])
-num_warm = int(np.sum((raw_adu >= limiar_warm_efetivo) & (raw_adu < limiar_hot)))
-
-if cal['suporta_dead_no_dark'] and limiar_dead >= 0:
-    yd_dark, xd_dark = np.where(raw_adu <= limiar_dead)
-    num_dead_dark = len(xd_dark)
-    str_dead_dark = f"{num_dead_dark}"
-else:
-    yd_dark, xd_dark = np.array([]), np.array([])
-    num_dead_dark = 0
-    str_dead_dark = "Requer Flat (Bias=0)"
-
-total_pixels = raw_adu.size
-
-# --- PAINEL DE INDICADORES PRINCIPAIS ---
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Equipamento / Obturador", f"{ex_d.get('Fabricante')} {ex_d.get('Modelo')}", ex_d.get('Cliques'))
-col2.metric("Piso de Ruído no Dark (MAD)", f"{cal['sigma_mad']:.2f} ADU", f"RMS Global: {cal['rms_total']:.2f} ADU", delta_color="off")
-col3.metric("Faixa Dinâmica Efetiva (DR)", f"{cal['dr_stops']:.2f} EV", f"{cal['dr_db']:.1f} dB | ADC {dados_dark['bits_efetivos']}-bit real", delta_color="off")
-
-if res_flat is not None:
-    col4.metric(
-        "Defeitos Pontuais (Hot / Dead)",
-        f"{num_hot} Hot | {res_flat['num_dead_flat']} Dead (Inativos)",
-        f"Baixa Sensibilidade: {res_flat['num_baixa_sens_flat']} px",
-        delta_color="off"
-    )
-else:
-    col4.metric(
-        "Anomalias no Dark (Hot / Warm)",
-        f"{num_hot} Hot Severos",
-        f"Warm (Cauda): {num_warm} | Dead: {str_dead_dark}",
-        delta_color="off"
-    )
-
-# --- SECAO DE ANALISE MULTI-FRAME ---
-if cal['bias_cal'] is not None or res_flat is not None:
-    st.divider()
-    st.subheader("Diagnóstico Radiométrico Multi-Frame (Desacoplamento de Ruído e Defeitos Ópticos)")
-    c_bias, c_flat = st.columns(2)
-
-    if cal['bias_cal'] is not None:
-        b = cal['bias_cal']
-        with c_bias:
-            st.markdown(f"**1. Análise de Offset / Bias Frame (`{b['arquivo_bias']}` | ISO {b['iso_bias']} | Exp: {b['exposicao_bias']} s)**")
-            st.markdown(
-                f"- **Ruído de Leitura Eletrônico Puro (Read Noise MAD):** `{b['read_noise_mad']:.2f} ADU` (RMS: `{b['rms_bias']:.2f} ADU`)\n"
-                f"- **Ruído Térmico Acumulado Isolado (Dark Current Noise):** `{b['ruido_termico_isolado']:.2f} ADU`\n"
-                f"- **Taxa de Geração Térmica (Dark Current Rate):** `{b['taxa_corrente_escuro_adu_s']:.3f} ADU/s` (Deriva média: `{b['deriva_pedestal_adu']:+.2f} ADU`)\n"
-                f"- **Faixa Dinâmica Base de Leitura (Sem Ruído Térmico):** `{b['dr_read_stops']:.2f} EV`"
-            )
+    if cal['suporta_dead_no_dark'] and limiar_dead >= 0:
+        yd_dark, xd_dark = np.where(raw_adu <= limiar_dead)
+        num_dead_dark = len(xd_dark)
+        str_dead_dark = f"{num_dead_dark}"
     else:
-        with c_bias:
-            st.info("Offset / Bias Frame não anexado.")
+        yd_dark, xd_dark = np.array([]), np.array([])
+        num_dead_dark = 0
+        str_dead_dark = "Requer Flat (Bias=0)"
+
+    total_pixels = raw_adu.size
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Equipamento / Obturador", f"{ex_d.get('Fabricante')} {ex_d.get('Modelo')}", ex_d.get('Cliques'))
+    col2.metric("Piso de Ruído no Dark (MAD)", f"{cal['sigma_mad']:.2f} ADU", f"RMS Global: {cal['rms_total']:.2f} ADU", delta_color="off")
+    col3.metric("Faixa Dinâmica Efetiva (DR)", f"{cal['dr_stops']:.2f} EV", f"{cal['dr_db']:.1f} dB | ADC {dados_dark['bits_efetivos']}-bit real", delta_color="off")
 
     if res_flat is not None:
-        with c_flat:
-            st.markdown(f"**2. Análise de Flat Frame (`{res_flat['arquivo_flat']}` | ISO {res_flat['iso_flat']} | Exp: {res_flat['exposicao_flat']} s | Sinal: {res_flat['nivel_exposicao_pct']:.1f}% Full Well)**")
-            for aviso in res_flat['avisos']:
-                st.warning(aviso)
-            st.markdown(
-                f"- **Dead Pixels Verdadeiros (Inativos à Luz / Sem Resposta Elétrica):** `{res_flat['num_dead_flat']} pixels` (`{res_flat['num_dead_flat']/total_pixels*100:.5f}%`)\n"
-                f"- **Pixels de Baixa Sensibilidade (Reagem à luz, mas com queda >= 35% vs vizinhos):** `{res_flat['num_baixa_sens_flat']} pixels` *(Corrigíveis por Flat-Fielding)*\n"
-                f"- **Não-Uniformidade de Resposta de Alta Frequência (PRNU):** `{res_flat['prnu_pct']:.2f}%`\n"
-                f"- **Fração de Área com Sombras Ópticas (Poeira / Manchas):** `{res_flat['pct_poeira']:.3f}%` do sensor"
-            )
+        col4.metric("Defeitos Pontuais", f"{num_hot} Hot | {res_flat['num_dead_flat']} Dead", f"Baixa Sensib.: {res_flat['num_baixa_sens_flat']} px", delta_color="off")
     else:
-        with c_flat:
-            st.info("Flat Frame não anexado.")
+        col4.metric("Anomalias no Dark", f"{num_hot} Hot Severos", f"Warm: {num_warm} | Dead: {str_dead_dark}", delta_color="off")
 
-st.divider()
+    if cal['bias_cal'] is not None or res_flat is not None:
+        st.divider()
+        c_bias, c_flat = st.columns(2)
+        if cal['bias_cal'] is not None:
+            b = cal['bias_cal']
+            with c_bias:
+                st.markdown(f"**Desacoplamento de Leitura (Offset / Bias):**")
+                st.markdown(f"- **Ruído de Leitura Puro (Read Noise):** `{b['read_noise_mad']:.2f} ADU`\n- **Ruído Térmico Isolado:** `{b['ruido_termico_isolado']:.2f} ADU`\n- **Taxa de Geração Térmica:** `{b['taxa_corrente_escuro_adu_s']:.3f} ADU/s`")
+        if res_flat is not None:
+            with c_flat:
+                st.markdown(f"**Certificação Óptica (Flat Frame):**")
+                st.markdown(f"- **Dead Pixels Verdadeiros:** `{res_flat['num_dead_flat']} px`\n- **Pixels de Baixa Sensibilidade (PRNU local):** `{res_flat['num_baixa_sens_flat']} px`\n- **Área de Sombra/Poeira:** `{res_flat['pct_poeira']:.3f}%`")
 
-if quadro_visualizado == "Flat Frame (Iluminação)" and dados_flat is not None:
-    dados_vis = dados_flat
-    cal_vis = analisar_dark_e_bias(dados_flat)
-elif quadro_visualizado == "Offset / Bias Frame" and dados_bias is not None:
-    dados_vis = dados_bias
-    cal_vis = analisar_dark_e_bias(dados_bias)
-else:
-    dados_vis = dados_dark
-    cal_vis = cal
+    st.divider()
 
-raw_vis = dados_vis['raw_adu']
-bl_vis = dados_vis['bl_medio']
-wl_vis = dados_vis['white_level']
+    if quadro_visualizado == "Flat Frame (Iluminação)" and dados_flat is not None:
+        dados_vis = dados_flat
+        cal_vis = analisar_dark_e_bias(dados_flat)
+    elif quadro_visualizado == "Offset / Bias Frame" and dados_bias is not None:
+        dados_vis = dados_bias
+        cal_vis = analisar_dark_e_bias(dados_bias)
+    else:
+        dados_vis = dados_dark
+        cal_vis = cal
 
-ganho = 2.0 ** ev
-rgb_preview_exp = np.clip(dados_vis['rgb_preview'].astype(np.float32) * ganho, 0.0, 1.0)
+    raw_vis = dados_vis['raw_adu']
+    bl_vis = dados_vis['bl_medio']
+    wl_vis = dados_vis['white_level']
+    ganho_v = 2.0 ** ev
+    rgb_prev_v = np.clip(dados_vis['rgb_preview'].astype(np.float32) * ganho_v, 0.0, 1.0)
 
-meia_janela = tam_janela // 2
-cx_clip = int(np.clip(st.session_state.centro_x, meia_janela, w - meia_janela))
-cy_clip = int(np.clip(st.session_state.centro_y, meia_janela, h - meia_janela))
-x1, x2 = cx_clip - meia_janela, cx_clip + meia_janela
-y1, y2 = cy_clip - meia_janela, cy_clip + meia_janela
+    half_j = tam_janela // 2
+    cx_c = int(np.clip(st.session_state.centro_x, half_j, w - half_j))
+    cy_c = int(np.clip(st.session_state.centro_y, half_j, h - half_j))
+    x1_c, x2_c = cx_c - half_j, cx_c + half_j
+    y1_c, y2_c = cy_c - half_j, cy_c + half_j
 
-# --- NAVEGACAO INTERATIVA POR CLIQUE DIRETO NO MAPA GLOBAL ---
-xd_mapa = res_flat['coords_dead_x'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else xd_dark[:1200]
-yd_mapa = res_flat['coords_dead_y'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else yd_dark[:1200]
+    xd_map = res_flat['coords_dead_x'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else xd_dark[:1200]
+    yd_map = res_flat['coords_dead_y'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else yd_dark[:1200]
 
-if SUPORTA_CLIQUE_IMAGEM:
-    st.subheader("Navegação Interativa (Clique em qualquer ponto da imagem abaixo para mover a Janela de Zoom)")
-    col_mapa_click, col_info_click = st.columns([1.35, 1])
-    with col_mapa_click:
-        pil_mapa, wp_prev, hp_prev = gerar_imagem_mapa_clicavel(
-            rgb_preview_exp, w, h, x1, y1, tam_janela, cx_clip, cy_clip, xh_plot, yh_plot, xd_mapa, yd_mapa, marcar_defeitos
-        )
-        coords_click = streamlit_image_coordinates(pil_mapa, key=f"mapa_click_{dados_vis['arquivo']}_{ev}_{limiar_hot}")
-        if coords_click is not None:
-            novo_cx = int(np.clip(round(coords_click["x"] / float(wp_prev) * w), meia_janela, w - meia_janela))
-            novo_cy = int(np.clip(round(coords_click["y"] / float(hp_prev) * h), meia_janela, h - meia_janela))
-            if novo_cx != st.session_state.centro_x or novo_cy != st.session_state.centro_y:
-                st.session_state.centro_x = novo_cx
-                st.session_state.centro_y = novo_cy
-                st.rerun()
-    with col_info_click:
-        st.markdown(
-            f"**Região Inspecionada:** Centro `({cx_clip}, {cy_clip})` | Recorte `X[{x1}:{x2}]`, `Y[{y1}:{y2}]`\n\n"
-            f"- **Leitura Exata no Pixel Central:** `{raw_vis[cy_clip, cx_clip]} ADU`\n"
-            f"- **Mínimo / Máximo na Janela de Zoom:** `{np.min(raw_vis[y1:y2, x1:x2])} ADU` / `{np.max(raw_vis[y1:y2, x1:x2])} ADU`\n"
-            f"- **Limiar de Hot Pixel Severo:** `>= {limiar_hot} ADU` (`{num_hot}` pixels detectados)\n"
-            f"- **Faixa de Warm Pixels (Cauda Térmica):** `{limiar_warm_efetivo}` a `{limiar_hot} ADU` (`{num_warm}` pixels)"
-        )
+    if SUPORTA_CLIQUE_IMAGEM:
+        st.subheader("Mapa Global Interativo (Clique na imagem para mover a Janela de Zoom)")
+        col_m_click, col_i_click = st.columns([1.35, 1])
+        with col_m_click:
+            pil_m, wp_p, hp_p = gerar_imagem_mapa_clicavel(
+                rgb_prev_v, w, h, x1_c, y1_c, tam_janela, cx_c, cy_c, xh_plot, yh_plot, xd_map, yd_map, marcar_defeitos
+            )
+            c_res = streamlit_image_coordinates(pil_m, key=f"mapa_click_{dados_vis['arquivo']}_{ev}_{limiar_hot}")
+            if c_res is not None:
+                nx = int(np.clip(round(c_res["x"] / float(wp_p) * w), half_j, w - half_j))
+                ny = int(np.clip(round(c_res["y"] / float(hp_p) * h), half_j, h - half_j))
+                if nx != st.session_state.centro_x or ny != st.session_state.centro_y:
+                    st.session_state.centro_x = nx
+                    st.session_state.centro_y = ny
+                    st.rerun()
+        with col_i_click:
+            st.markdown(
+                f"**Centro Atual:** `({cx_c}, {cy_c})` | `X[{x1_c}:{x2_c}], Y[{y1_c}:{y2_c}]`\n\n"
+                f"- **Leitura no Pixel Central:** `{raw_vis[cy_c, cx_c]} ADU`\n"
+                f"- **Mínimo / Máximo no Zoom:** `{np.min(raw_vis[y1_c:y2_c, x1_c:x2_c])} ADU` / `{np.max(raw_vis[y1_c:y2_c, x1_c:x2_c])} ADU`\n"
+                f"- **Limiar Hot Severo:** `>= {limiar_hot} ADU` (`{num_hot}` px)"
+            )
 
-recorte_adu = raw_vis[y1:y2, x1:x2].astype(np.float32)
+    rec_adu_v = raw_vis[y1_c:y2_c, x1_c:x2_c].astype(np.float32)
 
-# --- PLOTAGEM DO LAUDO COMPLETO (3 PAINEIS) ---
-fig = plt.figure(figsize=(15, 9.8), dpi=115, facecolor='white')
-gs = GridSpec(2, 2, figure=fig, height_ratios=[1.25, 1], width_ratios=[1.15, 1], hspace=0.32, wspace=0.22)
+    fig = plt.figure(figsize=(15, 9.8), dpi=115, facecolor='white')
+    gs = GridSpec(2, 2, figure=fig, height_ratios=[1.25, 1], width_ratios=[1.15, 1], hspace=0.32, wspace=0.22)
+    ax_full = fig.add_subplot(gs[0, 0])
+    ax_zoom = fig.add_subplot(gs[0, 1])
+    ax_hist = fig.add_subplot(gs[1, :])
 
-ax_full = fig.add_subplot(gs[0, 0])
-ax_zoom = fig.add_subplot(gs[0, 1])
-ax_hist = fig.add_subplot(gs[1, :])
+    ax_full.imshow(rgb_prev_v, interpolation='nearest', extent=[0, w, h, 0])
+    ax_full.set_title(f"1. Mapa Global - {quadro_visualizado} (+{ev:.1f} EV | {ganho:.1f}x)", fontsize=10.5, fontweight='bold')
+    ax_full.set_xlabel("Eixo X (px)", fontsize=9)
+    ax_full.set_ylabel("Eixo Y (px)", fontsize=9)
+    rect_z = patches.Rectangle((x1_c, y1_c), tam_janela, tam_janela, linewidth=1.8, edgecolor='#FFD700', facecolor='none')
+    ax_full.add_patch(rect_z)
+    ax_full.plot(cx_c, cy_c, marker='+', color='#FFD700', markersize=9, markeredgewidth=1.5)
 
-ax_full.imshow(rgb_preview_exp, interpolation='nearest', extent=[0, w, h, 0])
-ax_full.set_title(f"1. Mapa Global - {quadro_visualizado} (+{ev:.1f} EV | {ganho:.1f}x)", fontsize=10.5, fontweight='bold')
-ax_full.set_xlabel("Coordenada Horizontal X (px)", fontsize=9)
-ax_full.set_ylabel("Coordenada Vertical Y (px)", fontsize=9)
+    if marcar_defeitos:
+        if num_hot > 0:
+            ax_full.scatter(xh_plot, yh_plot, s=24, facecolors='none', edgecolors='#E63946', linewidth=1.1, label=f'Hot ({num_hot})')
+        if len(xd_map) > 0:
+            ax_full.scatter(xd_map, yd_map, s=24, facecolors='none', edgecolors='#00B4D8', linewidth=1.1, label='Defeito / Dead')
+    ax_full.legend(loc='upper right', framealpha=0.92, fontsize=8)
 
-rect = patches.Rectangle((x1, y1), tam_janela, tam_janela, linewidth=1.8, edgecolor='#FFD700', facecolor='none', label='Região de Zoom')
-ax_full.add_patch(rect)
-ax_full.plot(cx_clip, cy_clip, marker='+', color='#FFD700', markersize=9, markeredgewidth=1.5)
+    b_ref = bl_vis if bl_vis > 0 else cal_vis['mediana']
+    amp_adu = max(30.0, (wl_vis - b_ref) / ganho)
+    vmin_v = max(0.0, b_ref - 2.0 * cal_vis['sigma_mad'])
+    vmax_v = min(wl_vis, b_ref + amp_adu)
 
-if marcar_defeitos:
-    if num_hot > 0:
-        ax_full.scatter(xh_plot, yh_plot, s=24, facecolors='none', edgecolors='#E63946', linewidth=1.1, label=f'Hot Severo ({num_hot})')
-    if len(xd_mapa) > 0:
-        lbl_d = f'Dead Flat ({res_flat["num_dead_flat"]})' if (res_flat is not None and res_flat['num_dead_flat'] > 0) else f'Dead Dark ({num_dead_dark})'
-        ax_full.scatter(xd_mapa, yd_mapa, s=24, facecolors='none', edgecolors='#00B4D8', linewidth=1.1, label=lbl_d)
-ax_full.legend(loc='upper right', framealpha=0.92, fontsize=8)
+    if "Bayer" in modo_zoom:
+        im_zv = ax_zoom.imshow(rec_adu_v, cmap='inferno', vmin=vmin_v, vmax=vmax_v, interpolation='nearest', extent=[x1_c, x2_c, y2_c, y1_c])
+        cb_v = fig.colorbar(im_zv, ax=ax_zoom, fraction=0.046, pad=0.04)
+        cb_v.set_label("Leitura ADU", fontsize=8.5)
+    else:
+        rec_norm = np.clip((rec_adu_v - b_ref) / max(1.0, wl_vis - b_ref) * ganho, 0.0, 1.0)
+        ax_zoom.imshow(np.stack([rec_norm]*3, axis=-1), interpolation='nearest', extent=[x1_c, x2_c, y2_c, y1_c])
 
-base_ref = bl_vis if bl_vis > 0 else cal_vis['mediana']
-amplitude_adu = max(30.0, (wl_vis - base_ref) / ganho)
-vmin_adu = max(0.0, base_ref - 2.0 * cal_vis['sigma_mad'])
-vmax_adu = min(wl_vis, base_ref + amplitude_adu)
+    ax_zoom.set_title(f"2. Zoom 1:1 ({tam_janela}x{tam_janela} px) | Centro ({cx_c}, {cy_c})", fontsize=10.5, fontweight='bold')
+    ax_zoom.set_xlabel(f"Min: {np.min(rec_adu_v):.0f} ADU | Max: {np.max(rec_adu_v):.0f} ADU", fontsize=9)
+    ax_zoom.set_ylabel("Eixo Y (px)", fontsize=9)
 
-if "Bayer" in modo_zoom:
-    im_z = ax_zoom.imshow(recorte_adu, cmap='inferno', vmin=vmin_adu, vmax=vmax_adu, interpolation='nearest', extent=[x1, x2, y2, y1])
-    cbar = fig.colorbar(im_z, ax=ax_zoom, fraction=0.046, pad=0.04)
-    cbar.set_label("Leitura ADU (Escala EV)", fontsize=8.5)
-else:
-    recorte_norm = np.clip((recorte_adu - base_ref) / max(1.0, wl_vis - base_ref) * ganho, 0.0, 1.0)
-    ax_zoom.imshow(np.stack([recorte_norm]*3, axis=-1), interpolation='nearest', extent=[x1, x2, y2, y1])
+    if tam_janela <= 60:
+        ax_zoom.set_xticks(np.arange(x1_c, x2_c + 1, 1), minor=True)
+        ax_zoom.set_yticks(np.arange(y1_c, y2_c + 1, 1), minor=True)
+        ax_zoom.grid(which='minor', color='white', linestyle='-', linewidth=0.35, alpha=0.35)
 
-ax_zoom.set_title(f"2. Inspeção 1:1 ({tam_janela}x{tam_janela} px) | Centro ({cx_clip}, {cy_clip})", fontsize=10.5, fontweight='bold')
-ax_zoom.set_xlabel(f"Eixo X (Min: {np.min(recorte_adu):.0f} ADU | Max: {np.max(recorte_adu):.0f} ADU)", fontsize=9)
-ax_zoom.set_ylabel("Eixo Y (px)", fontsize=9)
+    if marcar_defeitos:
+        yh_zz, xh_zz = np.where(raw_vis[y1_c:y2_c, x1_c:x2_c] >= limiar_hot)
+        if len(xh_zz) > 0:
+            ax_zoom.scatter(x1_c + xh_zz + 0.5, y1_c + yh_zz + 0.5, s=90, facecolors='none', edgecolors='#2EC4B6', linewidth=1.6, label='Hot')
+        if cal['suporta_dead_no_dark'] and limiar_dead >= 0:
+            yd_zz, xd_zz = np.where(raw_vis[y1_c:y2_c, x1_c:x2_c] <= limiar_dead)
+            if len(xd_zz) > 0:
+                ax_zoom.scatter(x1_c + xd_zz + 0.5, y1_c + yd_zz + 0.5, s=90, facecolors='none', edgecolors='#00B4D8', linewidth=1.6, label='Dead')
+        if len(xh_zz) > 0:
+            ax_zoom.legend(loc='upper right', framealpha=0.92, fontsize=8)
 
-if tam_janela <= 60:
-    ax_zoom.set_xticks(np.arange(x1, x2 + 1, 1), minor=True)
-    ax_zoom.set_yticks(np.arange(y1, y2 + 1, 1), minor=True)
-    ax_zoom.grid(which='minor', color='white', linestyle='-', linewidth=0.35, alpha=0.35)
+    cnt_v = np.bincount(raw_vis.ravel())
+    vx = np.nonzero(cnt_v)[0]
+    vy = cnt_v[vx]
+    w_bar = max(1.0, (vx[-1] - vx[0]) / 260.0)
+    ax_hist.bar(vx, vy, width=w_bar, color='#1D3557', log=True, alpha=0.88, label='Distribuição ADU')
+    ax_hist.axvline(b_ref, color='#2A9D8F', linestyle='-', linewidth=1.6, label=f'Mediana ({b_ref:.0f} ADU)')
+    if quadro_visualizado == "Dark Frame (Principal)":
+        ax_hist.axvline(limiar_warm_efetivo, color='#F4A261', linestyle=':', linewidth=1.5, label=f'Warm ({limiar_warm_efetivo} ADU)')
+        ax_hist.axvline(limiar_hot, color='#E63946', linestyle='--', linewidth=1.6, label=f'Hot Severo ({limiar_hot} ADU)')
 
-if marcar_defeitos:
-    yh_z, xh_z = np.where(raw_adu[y1:y2, x1:x2] >= limiar_hot)
-    if len(xh_z) > 0:
-        ax_zoom.scatter(x1 + xh_z + 0.5, y1 + yh_z + 0.5, s=90, facecolors='none', edgecolors='#2EC4B6', linewidth=1.6, label='Hot Severo')
-    if cal['suporta_dead_no_dark'] and limiar_dead >= 0:
-        yd_z, xd_z = np.where(raw_adu[y1:y2, x1:x2] <= limiar_dead)
-        if len(xd_z) > 0:
-            ax_zoom.scatter(x1 + xd_z + 0.5, y1 + yd_z + 0.5, s=90, facecolors='none', edgecolors='#00B4D8', linewidth=1.6, label='Dead Pixel')
-    if len(xh_z) > 0:
-        ax_zoom.legend(loc='upper right', framealpha=0.92, fontsize=8)
+    ax_hist.set_title(f"3. Curva ADU | FPN H: {cal_vis['fpn_h']:.3f} ADU | FPN V: {cal_vis['fpn_v']:.3f} ADU", fontsize=10.5, fontweight='bold')
+    ax_hist.set_xlabel("Nível Digital do Conversor ADC (ADU)", fontsize=9)
+    ax_hist.set_ylabel("Fotodiodos (Escala Log)", fontsize=9)
+    ax_hist.legend(loc='upper right', fontsize=8.5)
+    ax_hist.grid(True, which="both", ls="--", alpha=0.32)
 
-contagens_adu = np.bincount(raw_vis.ravel())
-valores_adu_x = np.nonzero(contagens_adu)[0]
-contagens_y = contagens_adu[valores_adu_x]
+    buf_img = io.BytesIO()
+    fig.savefig(buf_img, format="png", dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    gc.collect()
 
-largura_barra = max(1.0, (valores_adu_x[-1] - valores_adu_x[0]) / 260.0)
-ax_hist.bar(valores_adu_x, contagens_y, width=largura_barra, color='#1D3557', log=True, alpha=0.88, label=f'Distribuição ADU ({dados_vis["arquivo"]})')
-ax_hist.axvline(base_ref, color='#2A9D8F', linestyle='-', linewidth=1.6, label=f'Pedestal / Mediana ({base_ref:.0f} ADU)')
+    bytes_png = buf_img.getvalue()
+    st.image(bytes_png, use_container_width=True)
 
-if quadro_visualizado == "Dark Frame (Principal)":
-    ax_hist.axvline(limiar_warm_efetivo, color='#F4A261', linestyle=':', linewidth=1.5, label=f'Limiar Warm Pixel ({limiar_warm_efetivo} ADU)')
-    ax_hist.axvline(limiar_hot, color='#E63946', linestyle='--', linewidth=1.6, label=f'Limiar Hot Severo ({limiar_hot} ADU)')
-    if cal['suporta_dead_no_dark'] and limiar_dead > 0:
-        ax_hist.axvline(limiar_dead, color='#00B4D8', linestyle='--', linewidth=1.6, label=f'Limiar Dead ({limiar_dead} ADU)')
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        st.download_button("Baixar Laudo Gráfico (PNG)", data=bytes_png, file_name=f"Laudo_{dados_dark['arquivo']}.png", mime="image/png", use_container_width=True)
 
-ax_hist.set_title(
-    f"3. Curva de Distribuição ADU | FPN Horizontal: {cal_vis['fpn_h']:.3f} ADU | FPN Vertical: {cal_vis['fpn_v']:.3f} ADU",
-    fontsize=10.5, fontweight='bold'
-)
-ax_hist.set_xlabel("Nível Digital do Conversor Analógico-Digital (ADU)", fontsize=9)
-ax_hist.set_ylabel("Contagem de Fotodiodos (Escala Log)", fontsize=9)
-ax_hist.legend(loc='upper right', fontsize=8.5)
-ax_hist.grid(True, which="both", ls="--", alpha=0.32)
-
-buf_img = io.BytesIO()
-fig.savefig(buf_img, format="png", dpi=160, bbox_inches="tight", facecolor="white")
-plt.close(fig)
-gc.collect()
-
-bytes_png = buf_img.getvalue()
-st.image(bytes_png, use_container_width=True)
-
-status_homologacao = "Homologado no Catálogo Oficial" if ex_d.get('Homologado_Catalogo') else "Calibração Autônoma via Metadados Nativos"
-linhas_relatorio = [
-    "=" * 102,
-    f"LAUDO METROLOGICO DE SENSOR DE IMAGEM | Quadro Base: {dados_dark['arquivo']} ({dados_dark['tamanho_mb']:.2f} MB) | {dados_dark['tipo_arquivo']}",
-    "=" * 102,
-    f"- Status de Homologacao       : {status_homologacao}",
-    f"- Fabricante / Modelo         : {ex_d.get('Fabricante')} {ex_d.get('Modelo')}",
-    f"- Arquitetura do Sensor       : {ex_d.get('Sensor')}",
-    f"- Contagem de Obturador       : {ex_d.get('Cliques')}",
-    f"- Parametros de Captura (Dark): ISO {ex_d.get('ISO')} | Exposicao: {ex_d.get('Exposicao_Str')} s | Temperatura EXIF: {ex_d.get('Temp_Sensor')}",
-    f"- Matriz / CFA / Quantizacao  : {w} x {h} px ({total_pixels/1e6:.2f} MP) | CFA: {dados_dark['padrao_cfa']} | Container: {dados_dark['bits_container']}-bit (ADC Efetivo: {dados_dark['bits_efetivos']}-bit, Passo: {dados_dark['passo_adc']} ADU)",
-    f"- Nivel de Preto (Bias)       : {dados_dark['bl_canais']} ADU (Mediana Real por Subcanal CFA: {cal['medianas_cfa']} ADU | Saturacao: {dados_dark['white_level']:.0f} ADU)",
-    "-" * 102,
-    "1. METRICAS DO DARK FRAME (RUIDO, FAIXA DINAMICA E DEFEITOS TERMICOS):",
-    f"- Ruido de Fundo Robusto (MAD): {cal['sigma_mad']:.2f} ADU (Por Subcanal CFA: {cal['sigmas_cfa']} ADU) | Ruido RMS Global: {cal['rms_total']:.2f} ADU",
-    f"- Faixa Dinamica no Dark (DR) : {cal['dr_stops']:.2f} EV (Stops) | {cal['dr_db']:.2f} dB",
-    f"- Fixed Pattern Noise (FPN)   : Banding Horizontal = {cal['fpn_h']:.3f} ADU | Banding Vertical = {cal['fpn_v']:.3f} ADU",
-    f"- Hot Pixels Severos (Fuga)   : {num_hot} pixels ({num_hot/total_pixels*100:.5f}% da matriz | Limiar >= {limiar_hot} ADU)",
-    f"- Warm Pixels (Cauda Termica) : {num_warm} pixels ({num_warm/total_pixels*100:.5f}% da matriz | Entre {limiar_warm_efetivo} e {limiar_hot} ADU)",
-    f"- Dead Pixels em Escuro       : {str_dead_dark}"
-]
-
-if cal['bias_cal'] is not None:
-    b = cal['bias_cal']
-    linhas_relatorio.extend([
-        "-" * 102,
-        f"2. DESACOPLAMENTO ELETRONICO VIA OFFSET / BIAS FRAME ({b['arquivo_bias']} | ISO {b['iso_bias']} | Exp: {b['exposicao_bias']} s):",
-        f"- Ruido de Leitura Puro (MAD) : {b['read_noise_mad']:.2f} ADU (RMS do Bias: {b['rms_bias']:.2f} ADU | Mediana: {b['mediana_bias']:.1f} ADU)",
-        f"- Ruido Termico Isolado       : {b['ruido_termico_isolado']:.2f} ADU (Calculado por quadratura entre Dark e Bias)",
-        f"- Taxa de Corrente de Escuro  : {b['taxa_corrente_escuro_adu_s']:.4f} ADU/s | Deriva de Pedestal: {b['deriva_pedestal_adu']:+.2f} ADU",
-        f"- Faixa Dinamica de Leitura   : {b['dr_read_stops']:.2f} EV"
-    ])
-
-if res_flat is not None:
-    linhas_relatorio.extend([
-        "-" * 102,
-        f"3. CERTIFICACAO OPTICA VIA FLAT FRAME ({res_flat['arquivo_flat']} | ISO {res_flat['iso_flat']} | Exp: {res_flat['exposicao_flat']} s | Exposicao Util: {res_flat['nivel_exposicao_pct']:.1f}% do Full Well):",
-        f"- Dead Pixels Verdadeiros     : {res_flat['num_dead_flat']} pixels ({res_flat['num_dead_flat']/total_pixels*100:.5f}% | Sem resposta eletrica a luz)",
-        f"- Pixels Baixa Sensibilidade  : {res_flat['num_baixa_sens_flat']} pixels (Respondem a luz, mas com queda >= 35% vs vizinhos 3x3 CFA)",
-        f"- PRNU de Alta Frequencia     : {res_flat['prnu_pct']:.2f}%",
-        f"- Area com Sombra de Poeira   : {res_flat['pct_poeira']:.3f}% da area util do sensor"
-    ])
-
-linhas_relatorio.append("=" * 102)
-texto_relatorio_final = "\n".join(linhas_relatorio)
-
-col_btn1, col_btn2 = st.columns(2)
-with col_btn1:
-    st.download_button(
-        label="Exportar Laudo Gráfico (PNG)",
-        data=bytes_png,
-        file_name=f"Laudo_Grafico_{os.path.splitext(dados_dark['arquivo'])[0]}.png",
-        mime="image/png",
-        use_container_width=True
-    )
-with col_btn2:
-    st.download_button(
-        label="Exportar Relatório Técnico (TXT)",
-        data=texto_relatorio_final.encode('utf-8'),
-        file_name=f"Laudo_Tecnico_{os.path.splitext(dados_dark['arquivo'])[0]}.txt",
-        mime="text/plain",
-        use_container_width=True
+# ==============================================================================
+# ABA 2: COMPARACAO TERMICA (SERIE TEMPORAL)
+# ==============================================================================
+with tab_termico:
+    st.subheader("Análise de Degradação Térmica e Aquecimento do Sensor")
+    st.markdown(
+        "Compare dois Dark Frames tirados em momentos diferentes da sessão (ex: **Dark 1: Câmera fria** logo ao ligar vs. "
+        "**Dark 2: Câmera aquecida** após 30 minutos de uso ou disparo contínuo) para medir o impacto do calor no ruído."
     )
 
-with st.expander("Relatório Técnico Completo (Texto Formatado)", expanded=True):
-    st.code(texto_relatorio_final, language="text")
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        arq_dark_frio = st.file_uploader("Dark Frame Frio (Início da Sessão)", type=tipos_aceitos, key="dk_frio")
+    with col_t2:
+        arq_dark_quente = st.file_uploader("Dark Frame Quente (Final da Sessão)", type=tipos_aceitos, key="dk_quente")
+
+    if arq_dark_frio and arq_dark_quente:
+        d_frio = processar_bytes_imagem(arq_dark_frio.getvalue(), arq_dark_frio.name, exigir_catalogo)
+        d_quente = processar_bytes_imagem(arq_dark_quente.getvalue(), arq_dark_quente.name, exigir_catalogo)
+
+        if d_frio['elegivel'] and d_quente['elegivel']:
+            cal_frio = analisar_dark_e_bias(d_frio)
+            cal_quente = analisar_dark_e_bias(d_quente)
+
+            delta_mad = cal_quente['sigma_mad'] - cal_frio['sigma_mad']
+            delta_hot = int(np.sum(d_quente['raw_adu'] >= limiar_hot)) - int(np.sum(d_frio['raw_adu'] >= limiar_hot))
+            delta_mediana = cal_quente['mediana'] - cal_frio['mediana']
+
+            st.markdown("### Resultados da Comparação Térmica")
+            ct1, ct2, ct3 = st.columns(3)
+            ct1.metric("Aumento do Ruído de Fundo (MAD)", f"+{delta_mad:.2f} ADU", f"Frio: {cal_frio['sigma_mad']:.2f} -> Quente: {cal_quente['sigma_mad']:.2f}", delta_color="inverse")
+            ct2.metric("Proliferação de Hot Pixels", f"+{delta_hot} px", "Novos pixels quentes ativados pelo calor", delta_color="inverse")
+            ct3.metric("Deriva de Pedestal (Bias Shift)", f"+{delta_mediana:.1f} ADU", "Elevação do nível de preto por aquecimento do circuito", delta_color="inverse")
+
+            st.success(
+                f"**Interpretação Térmica:** O aquecimento do sensor elevou o ruído de fundo em `{delta_mad:.2f} ADU` e ativou `{delta_hot}` novos hot pixels. "
+                f"Isso demonstra a importância de utilizar Dark Frames capturados sob a mesma temperatura ambiente e tempo de sessão para calibração adequada."
+            )
+        else:
+            st.error("Um dos arquivos enviados falhou na auditoria de elegibilidade.")
+    else:
+        st.info("Envie dois Dark Frames (frio e quente) para habilitar o relatório de degradação térmica.")
+
+# ==============================================================================
+# ABA 3: GUIA DIDATICO E GLOSSARIO
+# ==============================================================================
+with tab_tutorial:
+    st.subheader("Guia Didático e Dicionário Técnico de Metrologia de Sensores")
+    st.markdown(
+        "Esta seção explica de forma simplificada o significado de cada métrica exibida nos laudos e orienta "
+        "sobre como capturar os quadros em condições ideais."
+    )
+
+    st.markdown("### 1. Guia Prático de Captura dos Quadros de Calibração")
+    st.markdown(
+        "- **Dark Frame (Quadro Escuro):** Coloque a tampa na lente, certifique-se de que nenhum feixe de luz entre pelo visor (tampe o visor se necessário) e dispare com o **mesmo ISO e tempo de exposição** da sua foto real. Sirve para medir o calor e a corrente de escuro.\n"
+        "- **Offset / Bias Frame (Leitura Mínima):** Com a lente tampada, dispare na **velocidade de obturação mais rápida possível** da sua câmera (ex: 1/4000s ou 1/8000s) no mesmo ISO. Isola puramente o ruído eletrônico dos amplificadores.\n"
+        "- **Flat Frame (Campo Uniforme):** Aponte a câmera para uma superfície branca iluminada de forma homogênea (como uma mesa de luz, a tela de um computador totalmente branca ou o céu limpo no crepúsculo com a lente totalmente desfocada). A exposição deve deixar o histograma entre **30% e 70% da saturação** em ISO base."
+    )
+
+    st.markdown("### 2. Dicionário Técnico (Glossário)")
+    st.markdown(
+        "- **ADU (Analog-to-Digital Unit):** O valor numérico bruto gerado pelo conversor da câmera. Em uma câmera de 14-bits, vai de 0 a 16.383.\n"
+        "- **Ruído Robusto (MAD - Median Absolute Deviation):** Mede o 'chiado' de fundo do sensor sem distorção causada por pixels quentes isolados. Quanto menor, mais limpa é a imagem nas sombras.\n"
+        "- **Faixa Dinâmica (DR - Dynamic Range):** Mede quantos *stops* de luz (EV) o sensor consegue registrar entre o silêncio do ruído de fundo e a saturação total.\n"
+        "- **Banding FPN (Fixed Pattern Noise):** Variação estrutural em forma de listras horizontais ou verticais geradas pelos amplificadores de coluna do chip. Valores abaixo de `0.5 ADU` indicam excelente uniformidade.\n"
+        "- **PRNU (Photo-Response Non-Uniformity):** Variação percentual na sensibilidade individual de cada fotodiodo à luz. Em sensores modernos, fica abaixo de `1.5%`."
+    )
