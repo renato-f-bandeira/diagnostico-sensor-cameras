@@ -677,7 +677,7 @@ def gerar_imagem_mapa_clicavel(rgb_preview_exp, w_real, h_real, x1, y1, tam_jane
     return pil_img, wp, hp
 
 # ==============================================================================
-# 4. INTERFACE TECNICA COM ABAS DE NAVEGACAO (DIAGNOSTICO, COMPARACAO TERMICA E GLOSSARIO)
+# 4. INTERFACE TECNICA COM ABAS DE NAVEGACAO
 # ==============================================================================
 
 st.title("Laboratório de Metrologia e Diagnóstico de Sensores")
@@ -975,7 +975,7 @@ with tab_diag:
         ax_hist.axvline(limiar_hot, color='#E63946', linestyle='--', linewidth=1.6, label=f'Hot Severo ({limiar_hot} ADU)')
 
     ax_hist.set_title(f"3. Curva ADU | FPN H: {cal_vis['fpn_h']:.3f} ADU | FPN V: {cal_vis['fpn_v']:.3f} ADU", fontsize=10.5, fontweight='bold')
-    ax_hist.set_xlabel("Nível Digital do Conversor ADC (ADU)", fontsize=9)
+    ax_hist.set_xlabel("Nível Digital do Conversor Analógico-Digital (ADU)", fontsize=9)
     ax_hist.set_ylabel("Fotodiodos (Escala Log)", fontsize=9)
     ax_hist.legend(loc='upper right', fontsize=8.5)
     ax_hist.grid(True, which="both", ls="--", alpha=0.32)
@@ -1009,8 +1009,8 @@ with tab_termico:
         arq_dark_quente = st.file_uploader("Dark Frame Quente (Final da Sessão)", type=tipos_aceitos, key="dk_quente")
 
     if arq_dark_frio and arq_dark_quente:
-        d_frio = processar_bytes_imagem(arq_dark_frio.getvalue(), arq_dark_frio.name, exigir_catalogo)
-        d_quente = processar_bytes_imagem(arq_dark_quente.getvalue(), arq_dark_quente.name, exigir_catalogo)
+        d_frio = processar_arquivo_individual(arq_dark_frio.getvalue(), arq_dark_frio.name, exigir_catalogo)
+        d_quente = processar_arquivo_individual(arq_dark_quente.getvalue(), arq_dark_quente.name, exigir_catalogo)
 
         if d_frio['elegivel'] and d_quente['elegivel']:
             cal_frio = analisar_dark_e_bias(d_frio)
