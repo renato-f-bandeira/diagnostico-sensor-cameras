@@ -202,14 +202,20 @@ def _ler_maior_subifd_dng(caminho_arquivo):
         melhor_matriz = tifffile.imread(caminho_arquivo)
     return melhor_matriz
 
-def _reduzir_para_preview(rgb_float, largura_max=880):
-    h, w = rgb_float.shape[:2]
+def _reduzir_para_preview(rgb, largura_max=880):
+    """Reduz primeiro a imagem e só então converte para float16 normalizado."""
+    h, w = rgb.shape[:2]
     if w > largura_max:
         fator = largura_max / float(w)
         novo_h = max(1, int(round(h * fator)))
-        rgb_small = cv2.resize(rgb_float, (largura_max, novo_h), interpolation=cv2.INTER_AREA)
-        return rgb_small.astype(np.float16)
-    return rgb_float.astype(np.float16)
+        rgb_reduzido = cv2.resize(rgb, (largura_max, novo_h), interpolation=cv2.INTER_AREA)
+    else:
+        rgb_reduzido = rgb
+
+    if np.issubdtype(rgb_reduzido.dtype, np.integer):
+        # A conversão para float ocorre somente no preview já reduzido.
+        return (rgb_reduzido.astype(np.float32) / 65535.0).astype(np.float16)
+    return rgb_reduzido.astype(np.float16)
 
 def _detectar_passo_quantizacao_adc(raw_adu):
     amostra = raw_adu[::8, ::8].ravel()
@@ -222,6 +228,7 @@ def _detectar_passo_quantizacao_adc(raw_adu):
             return max(1, passo)
     return 1
 
+@st.cache_data(max_entries=3, show_spinner=False)
 def processar_arquivo_individual(file_bytes, nome_original, exigir_catalogo_estrito=False):
     ext = os.path.splitext(nome_original)[1].lower()
     tamanho_mb = len(file_bytes) / (1024.0 * 1024.0)
@@ -281,7 +288,7 @@ def processar_arquivo_individual(file_bytes, nome_original, exigir_catalogo_estr
 
                         try:
                             rgb = raw.postprocess(gamma=(1, 1), no_auto_bright=True, output_bps=16, half_size=True)
-                            rgb_preview = _reduzir_para_preview(rgb.astype(np.float32) / 65535.0)
+                            rgb_preview = _reduzir_para_preview(rgb)
                             del rgb
                         except Exception:
                             sub_raw = raw_adu[::2, ::2].astype(np.float32)
@@ -381,34 +388,60 @@ def processar_arquivo_individual(file_bytes, nome_original, exigir_catalogo_estr
             os.remove(caminho_arquivo)
 
 @st.cache_data(max_entries=3, show_spinner=False)
-def processar_pilha_imagens(uploaded_files_list, exigir_catalogo_estrito=False):
-    if not uploaded_files_list:
+def processar_pilha_imagens(arquivos_bytes, exigir_catalogo_estrito=False):
+    """Processa uma lista cacheável de tuplas (nome_arquivo, bytes_arquivo)."""
+    if not arquivos_bytes:
         return None
 
     resultados_individuais = []
-    for file_obj in uploaded_files_list[:3]:
-        res_ind = processar_arquivo_individual(file_obj.getvalue(), file_obj.name, exigir_catalogo_estrito)
+    for nome_arquivo, file_bytes in arquivos_bytes[:3]:
+        res_ind = processar_arquivo_individual(file_bytes, nome_arquivo, exigir_catalogo_estrito)
         if res_ind and res_ind.get('elegivel', False):
             resultados_individuais.append(res_ind)
 
     if not resultados_individuais:
-        return processar_arquivo_individual(uploaded_files_list[0].getvalue(), uploaded_files_list[0].name, exigir_catalogo_estrito)
+        nome_arquivo, file_bytes = arquivos_bytes[0]
+        return processar_arquivo_individual(file_bytes, nome_arquivo, exigir_catalogo_estrito)
 
     if len(resultados_individuais) == 1:
         return resultados_individuais[0]
 
     h_ref, w_ref = resultados_individuais[0]['raw_adu'].shape
-    pilha_arrays = []
-    for r in resultados_individuais:
-        if r['raw_adu'].shape == (h_ref, w_ref):
-            pilha_arrays.append(r['raw_adu'].astype(np.float32))
+    pilha_arrays = [
+        r['raw_adu'] for r in resultados_individuais
+        if r['raw_adu'].shape == (h_ref, w_ref)
+    ]
 
-    master_raw = np.median(np.stack(pilha_arrays, axis=0), axis=0).astype(np.uint16)
+    if len(pilha_arrays) == 1:
+        master_raw = pilha_arrays[0]
+    elif len(pilha_arrays) == 2:
+        # A mediana de dois valores é a média; mantém a aritmética inteira
+        # sem criar matrizes float32/float64 do tamanho do sensor.
+        soma = np.add(pilha_arrays[0], pilha_arrays[1], dtype=np.uint32)
+        np.right_shift(soma, 1, out=soma)
+        master_raw = soma.astype(np.uint16)
+        del soma
+    else:
+        # Mediana exata de três valores por pixel, usando somente buffers uint16.
+        a, b, c = pilha_arrays[:3]
+        menor_ab = np.empty_like(a)
+        maior_ab = np.empty_like(a)
+        np.minimum(a, b, out=menor_ab)
+        np.maximum(a, b, out=maior_ab)
+        np.minimum(maior_ab, c, out=maior_ab)
+        np.maximum(menor_ab, maior_ab, out=menor_ab)
+        master_raw = menor_ab
+        del maior_ab
+
     master_dict = resultados_individuais[0].copy()
-    master_dict['arquivo'] = f"Master Frame ({len(resultados_individuais)} quadros empilhados)"
+    master_dict['arquivo'] = f"Master Frame ({len(pilha_arrays)} quadros empilhados)"
     master_dict['raw_adu'] = master_raw
-    master_dict['tamanho_mb'] = sum(r['tamanho_mb'] for r in resultados_individuais)
+    master_dict['tamanho_mb'] = sum(
+        r['tamanho_mb'] for r in resultados_individuais
+        if r['raw_adu'].shape == (h_ref, w_ref)
+    )
 
+    del pilha_arrays, resultados_individuais
     gc.collect()
     return master_dict
 
@@ -676,6 +709,14 @@ def gerar_imagem_mapa_clicavel(rgb_preview_exp, w_real, h_real, x1, y1, tam_jane
 
     return pil_img, wp, hp
 
+def _sincronizar_centro_x():
+    st.session_state["centro_x"] = int(st.session_state["coord_x_input"])
+
+
+def _sincronizar_centro_y():
+    st.session_state["centro_y"] = int(st.session_state["coord_y_input"])
+
+
 # ==============================================================================
 # 4. INTERFACE TECNICA COM ABAS DE NAVEGACAO
 # ==============================================================================
@@ -718,21 +759,27 @@ if btn_iniciar:
     try:
         with st.spinner("Processando e empilhando quadros (Master Frames)..."):
             if arquivos_dark_up:
-                st.session_state.dados_dark_cache = processar_pilha_imagens(arquivos_dark_up, exigir_catalogo)
+                st.session_state.dados_dark_cache = processar_pilha_imagens(
+                    [(f.name, f.getvalue()) for f in arquivos_dark_up[:3]], exigir_catalogo
+                )
             elif exemplo_escolhido != "Nenhum (Usar meus arquivos)":
                 nome_ex = exemplo_escolhido.split(" ")[0]
                 bytes_ex = baixar_exemplo_github(nome_ex)
-                st.session_state.dados_dark_cache = processar_bytes_imagem(bytes_ex, nome_ex, exigir_catalogo)
+                st.session_state.dados_dark_cache = processar_arquivo_individual(bytes_ex, nome_ex, exigir_catalogo)
             else:
                 st.session_state.dados_dark_cache = None
 
             if arquivos_bias_up:
-                st.session_state.dados_bias_cache = processar_pilha_imagens(arquivos_bias_up, exigir_catalogo)
+                st.session_state.dados_bias_cache = processar_pilha_imagens(
+                    [(f.name, f.getvalue()) for f in arquivos_bias_up[:3]], exigir_catalogo
+                )
             else:
                 st.session_state.dados_bias_cache = None
 
             if arquivos_flat_up:
-                st.session_state.dados_flat_cache = processar_pilha_imagens(arquivos_flat_up, exigir_catalogo)
+                st.session_state.dados_flat_cache = processar_pilha_imagens(
+                    [(f.name, f.getvalue()) for f in arquivos_flat_up[:3]], exigir_catalogo
+                )
             else:
                 st.session_state.dados_flat_cache = None
     except Exception as erro_proc:
@@ -768,11 +815,21 @@ res_flat = analisar_flat_frame_profissional(dados_flat, dados_bias) if dados_fla
 raw_adu = dados_dark['raw_adu']
 wl_int = int(max(255, dados_dark['white_level']))
 
-# Inicializacao blindada do estado de navegacao do zoom (previne KeyError de ponta a ponta)
-if "centro_x" not in st.session_state or st.session_state.get("arq_ativo") != dados_dark['arquivo']:
-    st.session_state.centro_x = w // 2
-    st.session_state.centro_y = h // 2
-    st.session_state.arq_ativo = dados_dark['arquivo']
+# Inicialização explícita do estado do zoom antes da criação dos widgets.
+if (
+    "centro_x" not in st.session_state
+    or "centro_y" not in st.session_state
+    or st.session_state.get("arq_ativo") != dados_dark['arquivo']
+):
+    st.session_state["centro_x"] = w // 2
+    st.session_state["centro_y"] = h // 2
+    st.session_state["arq_ativo"] = dados_dark['arquivo']
+    st.session_state["coord_x_input"] = w // 2
+    st.session_state["coord_y_input"] = h // 2
+else:
+    # Também garante as chaves se a sessão veio de uma versão anterior do app.
+    st.session_state.setdefault("coord_x_input", int(st.session_state["centro_x"]))
+    st.session_state.setdefault("coord_y_input", int(st.session_state["centro_y"]))
 
 # ==============================================================================
 # ABA 1: DIAGNOSTICO PRINCIPAL
@@ -792,6 +849,17 @@ with tab_diag:
         modo_zoom = st.selectbox("Zoom 1:1 Render:", ["Matriz Bayer Bruta 1:1 (ADU)", "Escala Linear Normalizada"], key="zoom_mode_sel")
         tam_janela = st.selectbox("Tamanho Janela Recorte:", [30, 60, 120, 300], index=1, key="win_size_sel")
         marcar_defeitos = st.checkbox("Sobrepor marcadores de defeitos", value=True, key="mark_def_chk")
+
+        if st.button("Centralizar no Pixel Mais Quente", use_container_width=True, key="centralizar_hot_btn"):
+            y_hot_c, x_hot_c = np.unravel_index(int(np.argmax(raw_adu)), raw_adu.shape)
+            half_c = tam_janela // 2
+            x_min_c, x_max_c = min(half_c, w - 1), max(min(half_c, w - 1), w - half_c)
+            y_min_c, y_max_c = min(half_c, h - 1), max(min(half_c, h - 1), h - half_c)
+            st.session_state["centro_x"] = int(np.clip(x_hot_c, x_min_c, x_max_c))
+            st.session_state["centro_y"] = int(np.clip(y_hot_c, y_min_c, y_max_c))
+            # As chaves dos widgets são atualizadas antes de seus widgets serem instanciados.
+            st.session_state["coord_x_input"] = st.session_state["centro_x"]
+            st.session_state["coord_y_input"] = st.session_state["centro_y"]
 
         limiar_hot = st.slider("Limiar Hot Pixel Severo (ADU):", 0, wl_int, int(cal['limiar_hot_auto']), key="l_hot_sld")
         if cal['suporta_dead_no_dark']:
@@ -824,6 +892,10 @@ with tab_diag:
         vals_hot = raw_adu[yh_all, xh_all]
         idx_top = np.argsort(vals_hot)[::-1][:1200]
         xh_plot, yh_plot = xh_all[idx_top], yh_all[idx_top]
+    elif num_hot > 0:
+        vals_hot = raw_adu[yh_all, xh_all]
+        idx_ord = np.argsort(vals_hot)[::-1]
+        xh_plot, yh_plot = xh_all[idx_ord], yh_all[idx_ord]
     else:
         xh_plot, yh_plot = xh_all, yh_all
 
@@ -883,36 +955,66 @@ with tab_diag:
     rgb_prev_v = np.clip(dados_vis['rgb_preview'].astype(np.float32) * ganho_v, 0.0, 1.0)
 
     half_j = tam_janela // 2
-    cx_c = int(np.clip(st.session_state.get('centro_x', w // 2), half_j, w - half_j))
-    cy_c = int(np.clip(st.session_state.get('centro_y', h // 2), half_j, h - half_j))
+    x_min_zoom, x_max_zoom = min(half_j, w - 1), max(min(half_j, w - 1), w - half_j)
+    y_min_zoom, y_max_zoom = min(half_j, h - 1), max(min(half_j, h - 1), h - half_j)
+
+    # Limita o centro ao intervalo que permite exibir a janela e sincroniza os campos
+    # numéricos antes de instanciar os widgets (evita WidgetAlreadyInstantiatedError).
+    centro_x_limitado = int(np.clip(st.session_state["centro_x"], x_min_zoom, x_max_zoom))
+    centro_y_limitado = int(np.clip(st.session_state["centro_y"], y_min_zoom, y_max_zoom))
+    if centro_x_limitado != st.session_state["centro_x"]:
+        st.session_state["centro_x"] = centro_x_limitado
+        st.session_state["coord_x_input"] = centro_x_limitado
+    if centro_y_limitado != st.session_state["centro_y"]:
+        st.session_state["centro_y"] = centro_y_limitado
+        st.session_state["coord_y_input"] = centro_y_limitado
+
+    cx_c = int(st.session_state["centro_x"])
+    cy_c = int(st.session_state["centro_y"])
     x1_c, x2_c = cx_c - half_j, cx_c + half_j
     y1_c, y2_c = cy_c - half_j, cy_c + half_j
 
     xd_map = res_flat['coords_dead_x'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else xd_dark[:1200]
     yd_map = res_flat['coords_dead_y'] if (res_flat is not None and res_flat['num_dead_flat'] > 0) else yd_dark[:1200]
 
-    if SUPORTA_CLIQUE_IMAGEM:
-        st.subheader("Mapa Global Interativo (Clique na imagem para mover a Janela de Zoom)")
-        col_m_click, col_i_click = st.columns([1.35, 1])
-        with col_m_click:
+    st.subheader("Mapa Global Interativo" if SUPORTA_CLIQUE_IMAGEM else "Mapa Global e Navegação do Zoom")
+    col_m_click, col_i_click = st.columns([1.35, 1])
+    with col_m_click:
+        if SUPORTA_CLIQUE_IMAGEM:
+            st.caption("Clique no mapa para posicionar a janela de zoom 1:1.")
             pil_m, wp_p, hp_p = gerar_imagem_mapa_clicavel(
                 rgb_prev_v, w, h, x1_c, y1_c, tam_janela, cx_c, cy_c, xh_plot, yh_plot, xd_map, yd_map, marcar_defeitos
             )
-            c_res = streamlit_image_coordinates(pil_m, key=f"mapa_click_{dados_vis['arquivo']}_{ev}_{limiar_hot}")
-            if c_res is not None:
-                nx = int(np.clip(round(c_res["x"] / float(wp_p) * w), half_j, w - half_j))
-                ny = int(np.clip(round(c_res["y"] / float(hp_p) * h), half_j, h - half_j))
-                if nx != st.session_state.get('centro_x', 0) or ny != st.session_state.get('centro_y', 0):
-                    st.session_state.centro_x = nx
-                    st.session_state.centro_y = ny
-                    st.rerun()
-        with col_i_click:
-            st.markdown(
-                f"**Centro Atual:** `({cx_c}, {cy_c})` | `X[{x1_c}:{x2_c}], Y[{y1_c}:{y2_c}]`\n\n"
-                f"- **Leitura no Pixel Central:** `{raw_vis[cy_c, cx_c]} ADU`\n"
-                f"- **Mínimo / Máximo no Zoom:** `{np.min(raw_vis[y1_c:y2_c, x1_c:x2_c])} ADU` / `{np.max(raw_vis[y1_c:y2_c, x1_c:x2_c])} ADU`\n"
-                f"- **Limiar Hot Severo:** `>= {limiar_hot} ADU` (`{num_hot}` px)"
+            c_res = streamlit_image_coordinates(
+                pil_m, key=f"mapa_click_{dados_vis['arquivo']}_{ev}_{limiar_hot}"
             )
+            if c_res is not None:
+                nx = int(np.clip(round(c_res["x"] / float(wp_p) * w), x_min_zoom, x_max_zoom))
+                ny = int(np.clip(round(c_res["y"] / float(hp_p) * h), y_min_zoom, y_max_zoom))
+                if nx != st.session_state["centro_x"] or ny != st.session_state["centro_y"]:
+                    st.session_state["centro_x"] = nx
+                    st.session_state["centro_y"] = ny
+                    st.session_state["coord_x_input"] = nx
+                    st.session_state["coord_y_input"] = ny
+                    st.rerun()
+        else:
+            st.info("O componente de clique no mapa não está disponível neste ambiente. Use as coordenadas manuais ao lado.")
+
+    with col_i_click:
+        st.markdown(
+            f"**Centro Atual:** `({cx_c}, {cy_c})` | `X[{x1_c}:{x2_c}], Y[{y1_c}:{y2_c}]`\n\n"
+            f"- **Leitura no Pixel Central:** `{raw_vis[cy_c, cx_c]} ADU`\n"
+            f"- **Mínimo / Máximo no Zoom:** `{np.min(raw_vis[y1_c:y2_c, x1_c:x2_c])} ADU` / `{np.max(raw_vis[y1_c:y2_c, x1_c:x2_c])} ADU`\n"
+            f"- **Limiar Hot Severo:** `>= {limiar_hot} ADU` (`{num_hot}` px)"
+        )
+        st.number_input(
+            "Coordenada X (pixel)", min_value=x_min_zoom, max_value=x_max_zoom,
+            step=1, key="coord_x_input", on_change=_sincronizar_centro_x
+        )
+        st.number_input(
+            "Coordenada Y (pixel)", min_value=y_min_zoom, max_value=y_max_zoom,
+            step=1, key="coord_y_input", on_change=_sincronizar_centro_y
+        )
 
     rec_adu_v = raw_vis[y1_c:y2_c, x1_c:x2_c].astype(np.float32)
 
@@ -923,7 +1025,7 @@ with tab_diag:
     ax_hist = fig.add_subplot(gs[1, :])
 
     ax_full.imshow(rgb_prev_v, interpolation='nearest', extent=[0, w, h, 0])
-    ax_full.set_title(f"1. Mapa Global - {quadro_visualizado} (+{ev:.1f} EV | {ganho:.1f}x)", fontsize=10.5, fontweight='bold')
+    ax_full.set_title(f"1. Mapa Global - {quadro_visualizado} (+{ev:.1f} EV | {ganho_v:.1f}x)", fontsize=10.5, fontweight='bold')
     ax_full.set_xlabel("Eixo X (px)", fontsize=9)
     ax_full.set_ylabel("Eixo Y (px)", fontsize=9)
     rect_z = patches.Rectangle((x1_c, y1_c), tam_janela, tam_janela, linewidth=1.8, edgecolor='#FFD700', facecolor='none')
@@ -938,7 +1040,7 @@ with tab_diag:
     ax_full.legend(loc='upper right', framealpha=0.92, fontsize=8)
 
     b_ref = bl_vis if bl_vis > 0 else cal_vis['mediana']
-    amp_adu = max(30.0, (wl_vis - b_ref) / ganho)
+    amp_adu = max(30.0, (wl_vis - b_ref) / ganho_v)
     vmin_v = max(0.0, b_ref - 2.0 * cal_vis['sigma_mad'])
     vmax_v = min(wl_vis, b_ref + amp_adu)
 
@@ -947,7 +1049,7 @@ with tab_diag:
         cb_v = fig.colorbar(im_zv, ax=ax_zoom, fraction=0.046, pad=0.04)
         cb_v.set_label("Leitura ADU", fontsize=8.5)
     else:
-        rec_norm = np.clip((rec_adu_v - b_ref) / max(1.0, wl_vis - b_ref) * ganho, 0.0, 1.0)
+        rec_norm = np.clip((rec_adu_v - b_ref) / max(1.0, wl_vis - b_ref) * ganho_v, 0.0, 1.0)
         ax_zoom.imshow(np.stack([rec_norm]*3, axis=-1), interpolation='nearest', extent=[x1_c, x2_c, y2_c, y1_c])
 
     ax_zoom.set_title(f"2. Zoom 1:1 ({tam_janela}x{tam_janela} px) | Centro ({cx_c}, {cy_c})", fontsize=10.5, fontweight='bold')
@@ -996,7 +1098,136 @@ with tab_diag:
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        st.download_button("Baixar Laudo Gráfico (PNG)", data=bytes_png, file_name=f"Laudo_{dados_dark['arquivo']}.png", mime="image/png", use_container_width=True)
+        st.download_button(
+            "Baixar Laudo Gráfico (PNG)", data=bytes_png,
+            file_name=f"Laudo_{dados_dark['arquivo']}.png", mime="image/png",
+            use_container_width=True
+        )
+
+    def _bloco_metadados_quadro(titulo, dados_quadro):
+        if dados_quadro is None:
+            return [f"{titulo}: não enviado."]
+        exif_q = dados_quadro.get("exif", {})
+        return [
+            f"{titulo}:",
+            f"  Arquivo: {dados_quadro.get('arquivo', 'N/A')}",
+            f"  Fabricante / Modelo: {exif_q.get('Fabricante', 'N/A')} / {exif_q.get('Modelo', 'N/A')}",
+            f"  ISO: {exif_q.get('ISO', 'N/A')}",
+            f"  Tempo de exposição: {exif_q.get('Exposicao_Str', 'N/A')} ({exif_q.get('Exposicao_Seg', 0.0)} s)",
+            f"  Temperatura reportada: {exif_q.get('Temp_Sensor', 'N/A')}",
+        ]
+
+    linhas_relatorio = [
+        "LAUDO TÉCNICO COMPLETO - METROLOGIA E DIAGNÓSTICO DE SENSOR",
+        "=" * 76,
+        "",
+        "1. IDENTIFICAÇÃO DO EQUIPAMENTO E DO QUADRO PRINCIPAL",
+        f"Fabricante: {ex_d.get('Fabricante', 'N/A')}",
+        f"Modelo: {ex_d.get('Modelo', 'N/A')}",
+        f"Sensor identificado: {ex_d.get('Sensor', 'N/A')}",
+        f"Contagem de obturador: {ex_d.get('Cliques', 'Não disponível')}",
+        f"Arquivo / Master Frame: {dados_dark.get('arquivo', 'N/A')}",
+        f"Tipo de arquivo: {dados_dark.get('tipo_arquivo', 'N/A')}",
+        f"Dimensões da matriz RAW: {w} x {h} pixels ({raw_adu.size:,} pixels)",
+        f"Padrão CFA: {dados_dark.get('padrao_cfa', 'N/A')}",
+        f"ADC: {dados_dark.get('bits_efetivos', 'N/A')} bits efetivos; container de {dados_dark.get('bits_container', 'N/A')} bits",
+        f"Passo de quantização detectado: {dados_dark.get('passo_adc', 'N/A')} ADU",
+        f"Black Level por canal: {dados_dark.get('bl_canais', 'N/A')} ADU",
+        f"Black Level médio: {dados_dark.get('bl_medio', float('nan')):.2f} ADU",
+        f"White Level: {dados_dark.get('white_level', float('nan')):.0f} ADU",
+        f"Fração de pixels em zero: {dados_dark.get('fracao_zeros', 0.0) * 100.0:.4f}%",
+        f"Homologação no catálogo: {'Sim' if ex_d.get('Homologado_Catalogo', False) else 'Não'}",
+        "",
+        "2. METADADOS DOS QUADROS UTILIZADOS",
+    ]
+    linhas_relatorio.extend(_bloco_metadados_quadro("Dark Frame", dados_dark))
+    linhas_relatorio.extend(_bloco_metadados_quadro("Offset / Bias Frame", dados_bias))
+    linhas_relatorio.extend(_bloco_metadados_quadro("Flat Frame", dados_flat))
+
+    linhas_relatorio.extend([
+        "",
+        "3. DIAGNÓSTICO DO DARK FRAME",
+        f"Média global: {cal['media']:.4f} ADU",
+        f"Mediana global: {cal['mediana']:.4f} ADU",
+        f"Ruído robusto sigma_MAD: {cal['sigma_mad']:.4f} ADU",
+        f"RMS global: {cal['rms_total']:.4f} ADU",
+        f"Medianas dos subcanais CFA (ordem 2x2 do padrão): {cal['medianas_cfa']} ADU",
+        f"Sigmas dos subcanais CFA (ordem 2x2 do padrão): {cal['sigmas_cfa']} ADU",
+        f"Fixed Pattern Noise horizontal: {cal['fpn_h']:.5f} ADU",
+        f"Fixed Pattern Noise vertical: {cal['fpn_v']:.5f} ADU",
+        f"Faixa dinâmica: {cal['dr_stops']:.4f} EV ({cal['dr_db']:.3f} dB)",
+        f"Limiar automático Warm: {cal['limiar_warm_auto']} ADU",
+        f"Limiar automático Hot severo: {cal['limiar_hot_auto']} ADU",
+        f"Limiar automático Dead no Dark: {cal['limiar_dead_auto']} ADU",
+        f"Limiar Hot aplicado na interface: {limiar_hot} ADU",
+        f"Limiar Warm efetivo: {limiar_warm_efetivo} ADU",
+        f"Quantidade de Hot Pixels severos: {num_hot}",
+        f"Quantidade de Warm Pixels: {num_warm}",
+    ])
+
+    if cal['suporta_dead_no_dark']:
+        linhas_relatorio.append(f"Quantidade de pixels abaixo do limiar Dead no Dark: {num_dead_dark} (limiar {limiar_dead} ADU)")
+    else:
+        linhas_relatorio.append("Dead Pixels no Dark: não avaliados devido ao pedestal clipado/zero; a avaliação exige Flat Frame.")
+
+    linhas_relatorio.extend(["", "4. CALIBRAÇÃO OFFSET / BIAS"])
+    if cal['bias_cal'] is not None:
+        b_rel = cal['bias_cal']
+        linhas_relatorio.extend([
+            f"Mediana do Bias: {b_rel['mediana_bias']:.4f} ADU",
+            f"Ruído de leitura eletrônico (Read Noise): {b_rel['read_noise_mad']:.4f} ADU",
+            f"RMS do Bias: {b_rel['rms_bias']:.4f} ADU",
+            f"Ruído térmico isolado: {b_rel['ruido_termico_isolado']:.4f} ADU",
+            f"Taxa de corrente de escuro estimada: {b_rel['taxa_corrente_escuro_adu_s']:.6f} ADU/s",
+            f"Deriva de pedestal: {b_rel['deriva_pedestal_adu']:.4f} ADU",
+            f"Faixa dinâmica limitada pelo ruído de leitura: {b_rel['dr_read_stops']:.4f} EV",
+        ])
+    else:
+        linhas_relatorio.append("Quadro Bias não disponibilizado ou incompatível; o desacoplamento de ruído não foi calculado.")
+
+    linhas_relatorio.extend(["", "5. DIAGNÓSTICO DO FLAT FRAME"])
+    if res_flat is not None:
+        linhas_relatorio.extend([
+            f"Nível médio de exposição útil: {res_flat['nivel_exposicao_pct']:.4f}% da capacidade ADC",
+            f"PRNU estimado: {res_flat['prnu_pct']:.5f}%",
+            f"Dead Pixels verdadeiros: {res_flat['num_dead_flat']}",
+            f"Pixels de baixa sensibilidade: {res_flat['num_baixa_sens_flat']}",
+            f"Área estimada de sombra óptica/poeira: {res_flat['pct_poeira']:.5f}%",
+        ])
+        if res_flat.get('avisos'):
+            linhas_relatorio.append("Avisos do Flat Frame:")
+            linhas_relatorio.extend([f"  - {aviso}" for aviso in res_flat['avisos']])
+    else:
+        linhas_relatorio.append("Quadro Flat não disponibilizado ou incompatível; análise de PRNU, Dead Pixels sob iluminação e poeira não executada.")
+
+    linhas_relatorio.extend([
+        "",
+        "6. CONFIGURAÇÃO DA VISUALIZAÇÃO",
+        f"Quadro exibido: {quadro_visualizado}",
+        f"Ganho visual: +{ev:.1f} EV ({ganho_v:.3f}x)",
+        f"Modo de zoom: {modo_zoom}",
+        f"Janela de zoom: {tam_janela} x {tam_janela} pixels",
+        f"Centro da janela: X={cx_c}, Y={cy_c}",
+        f"Sobreposição de marcadores: {'Ativada' if marcar_defeitos else 'Desativada'}",
+        "",
+        "7. OBSERVAÇÕES METODOLÓGICAS",
+        "Os resultados deste laudo correspondem às matrizes RAW decodificadas e aos quadros efetivamente carregados.",
+        "As métricas de Bias dependem do envio de Offset/Bias Frame; as métricas de PRNU, baixa sensibilidade, Dead sob iluminação e poeira dependem do Flat Frame.",
+        "A análise de Dead Pixels no Dark é desativada quando o pedestal está truncado em zero, conforme a regra de elegibilidade implementada.",
+        "",
+        "Fim do laudo.",
+    ])
+    texto_relatorio_final = "\n".join(linhas_relatorio)
+
+    with col_btn2:
+        st.download_button(
+            "Baixar Relatório Técnico (TXT)", data=texto_relatorio_final.encode("utf-8"),
+            file_name=f"Laudo_Tecnico_{os.path.splitext(os.path.basename(dados_dark['arquivo']))[0]}.txt",
+            mime="text/plain", use_container_width=True
+        )
+
+    with st.expander("Relatório Técnico Completo"):
+        st.text(texto_relatorio_final)
 
 # ==============================================================================
 # ABA 2: COMPARACAO TERMICA (SERIE TEMPORAL)
