@@ -158,8 +158,8 @@ def extrair_metadados_exif(caminho_arquivo):
             'Bits_EXIF': dados_num.get('BitsPerSample', 'N/A'),
             'Compression_EXIF': dados_fmt.get('Compression', dados_fmt.get('NikonCompression', 'N/A')),
             'CFA_EXIF': dados_fmt.get('CFAPattern', dados_fmt.get('CFAPattern2', 'N/A')),
-            'BlackLevel_EXIF': dados_fmt.get('BlackLevel', dados_fmt.get('BlackLevel', None)),
-            'WhiteLevel_EXIF': dados_fmt.get('WhiteLevel', None)
+            'BlackLevel_EXIF': dados_num.get('BlackLevel', dados_fmt.get('BlackLevel', None)),
+            'WhiteLevel_EXIF': dados_num.get('WhiteLevel', None)
         }
     except Exception as e:
         return {'Fabricante': 'Erro', 'Modelo': str(e), 'Homologado_Catalogo': False, 'Spec_Catalogo': None, 'Exposicao_Seg': 0.0, 'Exposicao_Str': 'N/A', 'ISO': 'N/A'}
@@ -708,7 +708,7 @@ with st.sidebar:
 if not btn_iniciar and "dados_dark_cache" not in st.session_state:
     st.info(
         "Instruções:\n"
-        "1. Selecione na barra lateral até 3 arquivos para cada tipo de quadro (Dark, Bias, Flat) ou escolha uma amostra de referência.\n"
+        "1. Selecione na barra lateral até 3 arquivos para cada quadro (Dark, Bias, Flat) ou escolha uma amostra.\n"
         "2. Clique no botão **Iniciar Diagnóstico Metrológico**.\n"
         "3. Navegue entre as abas para ver o mapa global interativo, a degradação térmica ou o glossário explicativo."
     )
@@ -767,6 +767,12 @@ res_flat = analisar_flat_frame_profissional(dados_flat, dados_bias) if dados_fla
 
 raw_adu = dados_dark['raw_adu']
 wl_int = int(max(255, dados_dark['white_level']))
+
+# Inicializacao blindada do estado de navegacao do zoom (previne KeyError de ponta a ponta)
+if "centro_x" not in st.session_state or st.session_state.get("arq_ativo") != dados_dark['arquivo']:
+    st.session_state.centro_x = w // 2
+    st.session_state.centro_y = h // 2
+    st.session_state.arq_ativo = dados_dark['arquivo']
 
 # ==============================================================================
 # ABA 1: DIAGNOSTICO PRINCIPAL
@@ -877,8 +883,8 @@ with tab_diag:
     rgb_prev_v = np.clip(dados_vis['rgb_preview'].astype(np.float32) * ganho_v, 0.0, 1.0)
 
     half_j = tam_janela // 2
-    cx_c = int(np.clip(st.session_state.centro_x, half_j, w - half_j))
-    cy_c = int(np.clip(st.session_state.centro_y, half_j, h - half_j))
+    cx_c = int(np.clip(st.session_state.get('centro_x', w // 2), half_j, w - half_j))
+    cy_c = int(np.clip(st.session_state.get('centro_y', h // 2), half_j, h - half_j))
     x1_c, x2_c = cx_c - half_j, cx_c + half_j
     y1_c, y2_c = cy_c - half_j, cy_c + half_j
 
@@ -896,7 +902,7 @@ with tab_diag:
             if c_res is not None:
                 nx = int(np.clip(round(c_res["x"] / float(wp_p) * w), half_j, w - half_j))
                 ny = int(np.clip(round(c_res["y"] / float(hp_p) * h), half_j, h - half_j))
-                if nx != st.session_state.centro_x or ny != st.session_state.centro_y:
+                if nx != st.session_state.get('centro_x', 0) or ny != st.session_state.get('centro_y', 0):
                     st.session_state.centro_x = nx
                     st.session_state.centro_y = ny
                     st.rerun()
@@ -1047,7 +1053,7 @@ with tab_tutorial:
 
     st.markdown("### 1. Guia Prático de Captura dos Quadros de Calibração")
     st.markdown(
-        "- **Dark Frame (Quadro Escuro):** Coloque a tampa na lente, certifique-se de que nenhum feixe de luz entre pelo visor (tampe o visor se necessário) e dispare com o **mesmo ISO e tempo de exposição** da sua foto real. Sirve para medir o calor e a corrente de escuro.\n"
+        "- **Dark Frame (Quadro Escuro):** Coloque a tampa na lente, certifique-se de que nenhum feixe de luz entre pelo visor (tampe o visor se necessário) e dispare com o **mesmo ISO e tempo de exposição** da sua foto real. Serve para medir o calor e a corrente de escuro.\n"
         "- **Offset / Bias Frame (Leitura Mínima):** Com a lente tampada, dispare na **velocidade de obturação mais rápida possível** da sua câmera (ex: 1/4000s ou 1/8000s) no mesmo ISO. Isola puramente o ruído eletrônico dos amplificadores.\n"
         "- **Flat Frame (Campo Uniforme):** Aponte a câmera para uma superfície branca iluminada de forma homogênea (como uma mesa de luz, a tela de um computador totalmente branca ou o céu limpo no crepúsculo com a lente totalmente desfocada). A exposição deve deixar o histograma entre **30% e 70% da saturação** em ISO base."
     )
